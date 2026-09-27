@@ -829,6 +829,28 @@ h3 {
   min-width: 900px;
 }
 
+.records-table--services {
+  table-layout: fixed;
+}
+
+.records-table--services .service-col--name { width: 23%; }
+.records-table--services .service-col--proto { width: 10%; }
+.records-table--services .service-col--listen { width: 17%; }
+.records-table--services .service-col--target { width: 19%; }
+.records-table--services .service-col--auth { width: 10%; }
+.records-table--services .service-col--flows { width: 8%; }
+.records-table--services .service-col--traffic { width: 13%; }
+
+.records-table--services-outbound .service-col--name { width: 26%; }
+.records-table--services-outbound .service-col--proto { width: 14%; }
+.records-table--services-outbound .service-col--net { width: 16%; }
+.records-table--services-outbound .service-col--flows { width: 9%; }
+.records-table--services-outbound .service-col--traffic { width: 35%; }
+
+.records-table--services td {
+  overflow-wrap: anywhere;
+}
+
 .records-table--paths-complete {
   min-width: 1640px;
 }
@@ -992,6 +1014,33 @@ tbody tr:hover td {
 .records-table--peer .peer-col--quality { width: 10%; }
 .records-table--peer .peer-col--flight { width: 9%; }
 .records-table--peer .peer-col--evidence { width: 13%; }
+
+.peer-outbound-group__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-muted);
+}
+
+.peer-outbound-group__header .section-meta {
+  margin-top: 3px;
+  text-align: left;
+}
+
+.peer-outbound-group__title {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.peer-outbound-group__header .badge {
+  flex: 0 0 auto;
+}
 
 .cell-primary,
 .cell-secondary,

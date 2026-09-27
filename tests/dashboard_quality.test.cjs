@@ -67,6 +67,7 @@ function makeHarness() {
     refreshIntervalMs: 5_000,
     peerResult: null,
     peerResultReceivedAt: 0,
+    peerResultsBySession: new Map(),
     lastReceivedAt: 0,
     status: {}
   };
@@ -82,6 +83,7 @@ function makeHarness() {
     "metricAvailable",
     "statusResidenceMs",
     "effectivePathMetricAgeMs",
+    "peerSessionKey",
     "peerResultResidenceMs",
     "effectivePeerMetricAgeMs",
     "metricIsStale",

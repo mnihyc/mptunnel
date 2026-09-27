@@ -245,7 +245,16 @@
           <span id="inbound-services-count" class="badge badge--neutral">0 configured</span>
         </div>
         <div class="table-wrap table-wrap--records">
-          <table class="records-table records-table--inventory">
+          <table class="records-table records-table--inventory records-table--services">
+            <colgroup>
+              <col class="service-col--name">
+              <col class="service-col--proto">
+              <col class="service-col--listen">
+              <col class="service-col--target">
+              <col class="service-col--auth">
+              <col class="service-col--flows">
+              <col class="service-col--traffic">
+            </colgroup>
             <thead>
               <tr>
                 <th scope="col">Name</th>
@@ -363,47 +372,64 @@
         <div class="data-section__header data-section__header--actions">
           <div>
             <h2 id="overview-peer-title">Peer paths</h2>
-            <p id="overview-peer-context" class="section-meta">No peer sample</p>
+            <p id="overview-peer-context" class="section-meta">Peer samples grouped by MPP outbound</p>
           </div>
           <div class="header-badges">
             <span id="overview-peer-state" class="badge badge--neutral">No sample</span>
             <span id="overview-peer-allow-badge" class="badge badge--neutral">Local replies --</span>
           </div>
         </div>
-        <div class="table-wrap table-wrap--records">
-          <table class="records-table records-table--peer records-table--paths-complete">
-            <colgroup>
-              <col class="peer-col--state">
-              <col class="peer-col--path">
-              <col class="peer-col--carrier">
-              <col class="peer-col--use">
-              <col class="peer-col--latency">
-              <col class="peer-col--rate">
-              <col class="peer-col--loss">
-              <col class="peer-col--quality">
-              <col class="peer-col--flight">
-              <col class="peer-col--evidence">
-            </colgroup>
-            <thead>
-              <tr>
-                <th scope="col">State</th>
-                <th scope="col" title="Locally configured path / endpoint / peer Path ID / metric epoch / active observed hopping port">Path</th>
-                <th scope="col" title="Carrier">Carrier</th>
-                <th scope="col" title="Path usage and its traffic direction">Use</th>
-                <th scope="col" title="Round-trip time / RTT variation / jitter / peer-advisory source">Latency</th>
-                <th scope="col" title="Peer-advisory delivery and pacing / independent metric direction / provenance / scope">Rate</th>
-                <th scope="col" title="Loss / ECN">Loss</th>
-                <th scope="col" title="Peer-observed delivery-rate share / unloaded 64 KiB completion ETA">Quality</th>
-                <th scope="col" title="Queue / native carrier flight / native limit">Flight</th>
-                <th scope="col" title="Sender-direction confidence / samples / bytes / wire age plus cached residence / freshness window / observation flags">Evidence</th>
-              </tr>
-            </thead>
-            <tbody id="overview-peer-paths-body"></tbody>
-          </table>
+        <div id="overview-peer-path-groups" class="peer-path-groups"></div>
+        <div id="overview-peer-paths-empty" class="empty-state empty-state--compact" hidden>
+          <h3>No MPP outbound peers</h3>
+          <p>Configured MPP outbounds will appear here when present.</p>
         </div>
-        <div id="overview-peer-paths-empty" class="empty-state empty-state--compact">
-          <h3>No peer path sample</h3>
-        </div>
+        <template id="overview-peer-path-group-template">
+          <article class="peer-outbound-group">
+            <div class="peer-outbound-group__header">
+              <div>
+                <h3 class="peer-outbound-group__title" data-peer-outbound-title></h3>
+                <p class="section-meta" data-peer-outbound-context></p>
+              </div>
+              <span class="badge badge--neutral" data-peer-outbound-state></span>
+            </div>
+            <div class="table-wrap table-wrap--records">
+              <table class="records-table records-table--peer records-table--paths-complete">
+                <colgroup>
+                  <col class="peer-col--state">
+                  <col class="peer-col--path">
+                  <col class="peer-col--carrier">
+                  <col class="peer-col--use">
+                  <col class="peer-col--latency">
+                  <col class="peer-col--rate">
+                  <col class="peer-col--loss">
+                  <col class="peer-col--quality">
+                  <col class="peer-col--flight">
+                  <col class="peer-col--evidence">
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th scope="col">State</th>
+                    <th scope="col" title="Locally configured path / endpoint / peer Path ID / metric epoch / active observed hopping port">Path</th>
+                    <th scope="col" title="Carrier">Carrier</th>
+                    <th scope="col" title="Path usage and its traffic direction">Use</th>
+                    <th scope="col" title="Round-trip time / RTT variation / jitter / peer-advisory source">Latency</th>
+                    <th scope="col" title="Peer-advisory delivery and pacing / independent metric direction / provenance / scope">Rate</th>
+                    <th scope="col" title="Loss / ECN">Loss</th>
+                    <th scope="col" title="Peer-observed delivery-rate share / unloaded 64 KiB completion ETA">Quality</th>
+                    <th scope="col" title="Queue / native carrier flight / native limit">Flight</th>
+                    <th scope="col" title="Sender-direction confidence / samples / bytes / wire age plus cached residence / freshness window / observation flags">Evidence</th>
+                  </tr>
+                </thead>
+                <tbody data-peer-outbound-paths></tbody>
+              </table>
+            </div>
+            <div class="empty-state empty-state--compact" data-peer-outbound-empty hidden>
+              <h3>No peer path sample</h3>
+              <p data-peer-outbound-empty-detail></p>
+            </div>
+          </article>
+        </template>
       </section>
 
       <section class="data-section data-section--wide overview-connections"
@@ -448,7 +474,14 @@
           <span id="outbound-services-count" class="badge badge--neutral">0 configured</span>
         </div>
         <div class="table-wrap table-wrap--records">
-          <table class="records-table records-table--inventory">
+          <table class="records-table records-table--inventory records-table--services records-table--services-outbound">
+            <colgroup>
+              <col class="service-col--name">
+              <col class="service-col--proto">
+              <col class="service-col--net">
+              <col class="service-col--flows">
+              <col class="service-col--traffic">
+            </colgroup>
             <thead>
               <tr>
                 <th scope="col">Name</th>

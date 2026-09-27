@@ -69,8 +69,9 @@
     overviewPeerContext: byId("overview-peer-context"),
     overviewPeerState: byId("overview-peer-state"),
     overviewPeerAllowBadge: byId("overview-peer-allow-badge"),
-    overviewPeerPathsBody: byId("overview-peer-paths-body"),
+    overviewPeerPathsList: byId("overview-peer-path-groups"),
     overviewPeerPathsEmpty: byId("overview-peer-paths-empty"),
+    overviewPeerPathGroupTemplate: byId("overview-peer-path-group-template"),
     trafficBreakdownBody: byId("traffic-breakdown-body"),
     servicesList: byId("services-list"),
     admissionBody: byId("admission-body"),
@@ -158,6 +159,7 @@
     lastError: null,
     peerResult: null,
     peerResultReceivedAt: 0,
+    peerResultsBySession: new Map(),
     selectedPeerSessionKey: "",
     selectedTab: "overview",
     tableSorts: new Map(),
@@ -165,6 +167,7 @@
   };
 
   const sortableTableGroups = new Map();
+  const overviewPeerGroupNodes = new Map();
 
   class HttpError extends Error {
     constructor(status, message, body) {
@@ -282,6 +285,9 @@
     state.tokenPersistencePending = false;
     state.authenticationGeneration += 1;
     state.authenticationRefreshPending = false;
+    state.peerResultsBySession.clear();
+    state.peerResult = null;
+    state.peerResultReceivedAt = 0;
     storeToken("");
     try {
       window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
@@ -471,9 +477,16 @@
       heading.replaceChildren(button);
       return label;
     });
-    group.surfaces.push({ headings: headings, columns: columns, labels: labels });
+    group.surfaces.push({ table: table, headings: headings, columns: columns, labels: labels });
     sortableTableGroups.set(tableKey, group);
     updateTableSortHeaders(tableKey);
+  }
+
+  function unbindSortableTable(tableKey, table) {
+    const group = sortableTableGroups.get(tableKey);
+    if (!group) return;
+    group.surfaces = group.surfaces.filter(function (surface) { return surface.table !== table; });
+    if (group.surfaces.length === 0) sortableTableGroups.delete(tableKey);
   }
 
   function asArray(value) {
@@ -746,6 +759,10 @@
   }
 
   function peerResultResidenceMs(result) {
+    const live = result && state.peerResultsBySession.get(peerSessionKey(result));
+    if (live && live.result === result && live.receivedAt > 0) {
+      return Math.max(0, Date.now() - live.receivedAt);
+    }
     if (result && result === state.peerResult && state.peerResultReceivedAt > 0) {
       return Math.max(0, Date.now() - state.peerResultReceivedAt);
     }
@@ -1300,7 +1317,8 @@
     try {
       const refreshed = await refreshStatus(source);
       if (refreshed && !state.authenticationRequired && peerSurfaceVisible() && peerRequestSupported()) {
-        await requestPeerStatus(source, true);
+        if (state.selectedTab === "overview") await requestPeerStatuses(source, true);
+        else await requestPeerStatus(source, true);
       }
     } finally {
       state.refreshCycleRunning = false;
@@ -1689,7 +1707,11 @@
     inbounds.forEach(function (inbound) {
       const row = createElement("tr");
       const inboundFlows = flows.filter(function (flow) { return String(flow.inbound) === String(inbound.name || ""); });
-      appendCell(row, "Name", inbound.name || titleCase(inbound.protocol), "cell-primary");
+      appendCell(
+        row,
+        "Name",
+        createElement("span", "cell-primary", inbound.name || titleCase(inbound.protocol))
+      );
       appendCell(row, "Proto", titleCase(inbound.protocol));
       const listeners = asArray(inbound.listen).map(String);
       if (inbound.interface_name) listeners.push(inbound.interface_name);
@@ -1726,7 +1748,7 @@
     outbounds.forEach(function (outbound) {
       const row = createElement("tr");
       const outboundFlows = flows.filter(function (flow) { return String(flow.outbound || "") === String(outbound.name || ""); });
-      appendCell(row, "Name", outbound.name || "Outbound", "cell-primary");
+      appendCell(row, "Name", createElement("span", "cell-primary", outbound.name || "Outbound"));
       appendCell(row, "Proto", titleCase(outbound.protocol));
       appendCell(
         row,
@@ -2346,7 +2368,8 @@
   }
 
   function peerSessionKey(session) {
-    return String(session.service) + ":" + String(session.service_name) + ":" + String(session.session_id);
+    return JSON.stringify([session.service, session.service_index, session.service_name, session.session_id]
+      .map(function (value) { return String(value === undefined || value === null ? "" : value); }));
   }
 
   function selectedPeerSession() {
@@ -2359,28 +2382,29 @@
     if (!session) return null;
     const results = asArray(asObject(state.status.diagnostics).peer_results)
       .filter(function (result) {
-        return String(result.session_id) === String(session.session_id) &&
-          String(result.service) === String(session.service) &&
-          String(result.service_name) === String(session.service_name);
+        return peerSessionKey(result) === peerSessionKey(session);
       })
       .sort(function (left, right) { return finiteNumber(right.received_unix_ms) - finiteNumber(left.received_unix_ms); });
-    return results[0] || null;
+    const cached = results[0] || null;
+    const live = state.peerResultsBySession.get(peerSessionKey(session));
+    const explicit = state.peerResult && peerSessionKey(state.peerResult) === peerSessionKey(session)
+      ? state.peerResult
+      : null;
+    return [cached, live && live.result, explicit].filter(Boolean).reduce(function (newest, candidate) {
+      return !newest || finiteNumber(candidate.received_unix_ms) >= finiteNumber(newest.received_unix_ms)
+        ? candidate
+        : newest;
+    }, null);
   }
 
   function renderSelectedPeerResult() {
     const selectedSession = selectedPeerSession();
-    const explicit = state.peerResult && selectedSession &&
-      String(state.peerResult.session_id) === String(selectedSession.session_id) &&
-      String(state.peerResult.service) === String(selectedSession.service) &&
-      String(state.peerResult.service_name) === String(selectedSession.service_name)
-      ? state.peerResult
-      : null;
-    const result = explicit || newestCachedPeerResult(selectedSession);
+    const result = newestCachedPeerResult(selectedSession);
     renderPeerResult(result);
-    renderOverviewPeerResult(result, selectedSession);
+    renderOverviewPeerResult();
   }
 
-  function appendPeerPathRow(body, pathValue, result, qualityValue) {
+  function appendPeerPathRow(body, pathValue, result, qualityValue, sessionId) {
     const path = asObject(pathValue);
     const qualityValueObject = asObject(qualityValue);
     const effectiveAgeMs = effectivePeerMetricAgeMs(path, result);
@@ -2402,6 +2426,7 @@
     const identityDetail = [
       formatIdentifier(path.path_id) + " / " + formatIdentifier(path.metric_epoch)
     ];
+    if (sessionId) identityDetail.push("Session " + formatSessionId(sessionId));
     if (path.port_hopping) {
       const activePort = formatOptionalMetric(
         path.active_port,
@@ -2420,6 +2445,7 @@
       "Configured endpoint: " + (path.endpoint || "-"),
       "Peer Path ID: " + formatIdentifier(path.path_id),
       "Metric epoch: " + formatIdentifier(path.metric_epoch),
+      sessionId ? "Peer session: " + formatSessionId(sessionId) : "",
       path.port_hopping
         ? "Active observed port: " + formatOptionalMetric(
           path.active_port,
@@ -2512,33 +2538,244 @@
     });
   }
 
-  function renderOverviewPeerResult(result, selectedSession) {
-    if (!result) {
+  function peerOutboundMatches(item, group) {
+    if (String(item.service || "") !== "mpp_outbound") return false;
+    const serviceName = String(item.service_name || "");
+    if (serviceName && group.outboundName) return serviceName === group.outboundName;
+    return finiteNumber(item.service_index) === group.serviceIndex;
+  }
+
+  function overviewPeerOutboundGroups() {
+    // Diagnostics index only MPP client contexts. Filtering this inventory first
+    // keeps the fallback ordinal aligned even when native outbounds are interleaved.
+    const configured = asArray(state.status.outbounds)
+      .map(asObject)
+      .filter(function (outbound) { return String(outbound.protocol || "") === "mpp"; });
+    const diagnostics = asObject(state.status.diagnostics);
+    const allSessions = asArray(diagnostics.peer_sessions).map(asObject);
+    const sessions = allSessions
+      .filter(function (session) { return String(session.service || "") === "mpp_outbound"; });
+    const results = asArray(diagnostics.peer_results)
+      .map(asObject)
+      .filter(function (result) { return String(result.service || "") === "mpp_outbound"; });
+    const activeSessionKeys = new Set(allSessions.map(peerSessionKey));
+    state.peerResultsBySession.forEach(function (_entry, key) {
+      if (!activeSessionKeys.has(key)) state.peerResultsBySession.delete(key);
+    });
+    const groups = configured.map(function (outbound, serviceIndex) {
+      const name = String(outbound.name || "");
+      return {
+        key: name || "mpp_outbound:" + serviceIndex,
+        name: name || "MPP outbound " + serviceIndex,
+        outboundName: name,
+        serviceIndex: serviceIndex,
+        sessions: [],
+        results: []
+      };
+    });
+
+    function groupFor(item) {
+      return groups.find(function (group) { return peerOutboundMatches(item, group); }) || null;
+    }
+
+    sessions.forEach(function (session) {
+      const group = groupFor(session);
+      if (group && !group.sessions.some(function (entry) {
+        return peerSessionKey(entry) === peerSessionKey(session);
+      })) {
+        group.sessions.push(session);
+      }
+    });
+    results.forEach(function (result) {
+      const group = groupFor(result);
+      if (!group || !group.sessions.some(function (session) {
+        return peerSessionKey(session) === peerSessionKey(result);
+      })) return;
+      const existing = group.results.find(function (entry) {
+        return peerSessionKey(entry) === peerSessionKey(result);
+      });
+      if (!existing || finiteNumber(result.received_unix_ms) > finiteNumber(existing.received_unix_ms)) {
+        if (existing) group.results.splice(group.results.indexOf(existing), 1);
+        group.results.push(result);
+      }
+    });
+    state.peerResultsBySession.forEach(function (entry) {
+      const result = entry.result;
+      const group = groupFor(result);
+      if (!group || !group.sessions.some(function (session) {
+        return peerSessionKey(session) === peerSessionKey(result);
+      })) return;
+      const existing = group.results.find(function (item) {
+        return peerSessionKey(item) === peerSessionKey(result);
+      });
+      if (!existing || finiteNumber(result.received_unix_ms) >= finiteNumber(existing.received_unix_ms)) {
+        if (existing) group.results.splice(group.results.indexOf(existing), 1);
+        group.results.push(result);
+      }
+    });
+
+    groups.forEach(function (group) {
+      const peers = new Map();
+      group.sessions.forEach(function (session) {
+        peers.set(peerSessionKey(session), { session: session, result: null });
+      });
+      group.results.forEach(function (result) {
+        const key = peerSessionKey(result);
+        const peer = peers.get(key);
+        if (peer) peer.result = result;
+      });
+      group.peers = Array.from(peers.values());
+    });
+    return groups;
+  }
+
+  function renderOverviewPeerResult() {
+    const groups = overviewPeerOutboundGroups();
+    let connectedCount = 0;
+    let sampleCount = 0;
+    let failedCount = 0;
+    const activeGroupKeys = new Set();
+    const activePeerQualityKeys = new Set();
+    elements.overviewPeerPathsList.replaceChildren();
+
+    groups.forEach(function (group, groupIndex) {
+      const peerTableKey = "overview-peer-outbound:" + group.key;
+      let article = overviewPeerGroupNodes.get(group.key);
+      const isNewArticle = !article;
+      if (!article) {
+        article = elements.overviewPeerPathGroupTemplate.content.firstElementChild.cloneNode(true);
+        overviewPeerGroupNodes.set(group.key, article);
+      }
+      activeGroupKeys.add(group.key);
+      const title = article.querySelector("[data-peer-outbound-title]");
+      const context = article.querySelector("[data-peer-outbound-context]");
+      const stateBadge = article.querySelector("[data-peer-outbound-state]");
+      const body = article.querySelector("[data-peer-outbound-paths]");
+      body.replaceChildren();
+      const empty = article.querySelector("[data-peer-outbound-empty]");
+      const emptyDetail = article.querySelector("[data-peer-outbound-empty-detail]");
+      const titleId = "overview-peer-outbound-title-" + groupIndex;
+      const contextId = "overview-peer-outbound-context-" + groupIndex;
+      title.id = titleId;
+      context.id = contextId;
+      article.setAttribute("aria-labelledby", titleId);
+      article.setAttribute("aria-describedby", contextId);
+      title.textContent = group.name;
+
+      const peers = group.peers;
+      const peerResults = peers.filter(function (peer) { return peer.result !== null; });
+      const resultsForContext = peerResults.map(function (peer) { return peer.result; });
+      const groupFailedCount = peerResults.filter(function (peer) {
+        return String(peer.result.code) !== "ok";
+      }).length;
+      connectedCount += group.sessions.length;
+      sampleCount += peerResults.length;
+      failedCount += groupFailedCount;
+
+      const carriers = group.sessions.reduce(function (total, session) {
+        return total + Math.max(0, finiteNumber(session.carrier_count));
+      }, 0);
+      const sessionText = group.sessions.length === 1
+        ? "Session " + formatSessionId(group.sessions[0].session_id)
+        : group.sessions.length + " authenticated sessions";
+      const contextParts = group.sessions.length === 0
+        ? ["No authenticated peer session"]
+        : [sessionText, formatCount(carriers) + " carriers"];
+      if (resultsForContext.length > 0) {
+        const latest = resultsForContext.reduce(function (newest, item) {
+          return finiteNumber(item.received_unix_ms) > finiteNumber(newest.received_unix_ms) ? item : newest;
+        });
+        contextParts.push(formatResidenceRelative(peerResultResidenceMs(latest)));
+        if (peerResults.length < group.sessions.length) {
+          contextParts.push(peerResults.length + "/" + group.sessions.length + " sampled");
+        }
+      }
+      context.textContent = contextParts.join(" · ");
+
+      const allResultsOk = peerResults.length > 0 && groupFailedCount === 0;
+      const complete = peerResults.length === peers.length && peers.length > 0;
+      const badgeKind = allResultsOk && complete ? "success"
+        : peerResults.length > 0 || group.sessions.length > 0 ? "warning" : "neutral";
+      stateBadge.className = "badge badge--" + badgeKind;
+      if (peerResults.length === 0) stateBadge.textContent = "No sample";
+      else if (peerResults.length === 1) stateBadge.textContent = titleCase(peerResults[0].result.code);
+      else stateBadge.textContent = peerResults.length + " samples";
+
+      let pathCount = 0;
+      const entries = [];
+      const includeSession = peers.length > 1;
+      peers.forEach(function (peer) {
+        const peerResult = peer.result;
+        if (!peerResult) return;
+        const qualityTableKey = peerTableKey + ":quality:" + String(peer.session.session_id);
+        activePeerQualityKeys.add(qualityTableKey);
+        entries.push.apply(
+          entries,
+          sortedPathEntries(asArray(peerResult.paths), peerResult, qualityTableKey, peerPathSortValue)
+        );
+      });
+      sortTableEntries(entries, peerTableKey, peerPathSortValue).forEach(function (entry) {
+        appendPeerPathRow(
+          body,
+          entry.path,
+          entry.result,
+          entry.quality,
+          includeSession ? entry.result.session_id : null
+        );
+        pathCount += 1;
+      });
+      empty.hidden = pathCount !== 0;
+      if (pathCount === 0) {
+        emptyDetail.textContent = group.sessions.length > 0
+          ? "No peer path sample has been received for this outbound."
+          : "No authenticated peer session is currently connected.";
+      }
+      if (isNewArticle) {
+        bindSortableTable(body, peerTableKey, PEER_PATH_SORT_COLUMNS, function () {
+          if (state.status) renderSelectedPeerResult();
+        });
+      }
+      elements.overviewPeerPathsList.append(article);
+    });
+
+    Array.from(overviewPeerGroupNodes.entries()).forEach(function (entry) {
+      const key = entry[0];
+      const article = entry[1];
+      if (activeGroupKeys.has(key)) return;
+      const tableKey = "overview-peer-outbound:" + key;
+      unbindSortableTable(tableKey, article.querySelector("table"));
+      overviewPeerGroupNodes.delete(key);
+      state.tableSorts.delete(tableKey);
+    });
+    Array.from(state.nativeDeliveryCursors.keys()).forEach(function (tableKey) {
+      if (
+        String(tableKey).startsWith("overview-peer-outbound:") &&
+        !activePeerQualityKeys.has(tableKey)
+      ) {
+        state.nativeDeliveryCursors.delete(tableKey);
+      }
+    });
+
+    elements.overviewPeerPathsEmpty.hidden = groups.length !== 0;
+    if (groups.length === 0) {
+      elements.overviewPeerContext.textContent = "No configured MPP outbound";
       elements.overviewPeerState.className = "badge badge--neutral";
-      elements.overviewPeerState.textContent = "No sample";
-      elements.overviewPeerContext.textContent = selectedSession
-        ? serviceLabel(selectedSession) + " / " + formatSessionId(selectedSession.session_id)
-        : "No connected peer";
-      renderPeerPaths(
-        elements.overviewPeerPathsBody,
-        elements.overviewPeerPathsEmpty,
-        null,
-        "overview-peer-paths"
-      );
+      elements.overviewPeerState.textContent = "No outbounds";
       return;
     }
-    const ok = String(result.code) === "ok";
-    elements.overviewPeerState.className = "badge " + (ok ? "badge--success" : "badge--warning");
-    elements.overviewPeerState.textContent = titleCase(result.code);
+
     elements.overviewPeerContext.textContent =
-      serviceLabel(result) + " / " + formatSessionId(result.session_id) + " / " +
-      formatResidenceRelative(peerResultResidenceMs(result));
-    renderPeerPaths(
-      elements.overviewPeerPathsBody,
-      elements.overviewPeerPathsEmpty,
-      result,
-      "overview-peer-paths"
+      formatCount(groups.length) + " configured MPP outbounds · " +
+      formatCount(connectedCount) + " connected sessions · " +
+      formatCount(sampleCount) + " peer samples";
+    const allConnectedSampled = connectedCount > 0 && sampleCount === connectedCount && failedCount === 0;
+    const someSampled = sampleCount > 0;
+    elements.overviewPeerState.className = "badge " + (
+      allConnectedSampled ? "badge--success" : someSampled || connectedCount > 0 ? "badge--warning" : "badge--neutral"
     );
+    elements.overviewPeerState.textContent = connectedCount === 0
+      ? "No connected peers"
+      : sampleCount + "/" + connectedCount + " sampled";
   }
 
   function renderPeerResult(result) {
@@ -2563,16 +2800,79 @@
     renderPeerPaths(elements.peerPathsBody, elements.peerPathsEmpty, result, "peer-path-status");
   }
 
-  async function requestPeerStatus(source, coordinated) {
-    if (state.peerFetching || state.fetching || (state.refreshCycleRunning && !coordinated)) return;
-    const session = selectedPeerSession();
-    if (!session) return;
+  async function requestPeerStatusForSession(session) {
+    const authenticationGeneration = state.authenticationGeneration;
     const payload = {
       service: session.service,
       service_name: session.service_name,
       session_id: session.session_id
     };
+    const result = await requestJson(PEER_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (authenticationGeneration !== state.authenticationGeneration) return null;
+    if (peerSessionKey(result) !== peerSessionKey(session)) {
+      throw new Error("Peer diagnostics returned a different outbound session");
+    }
+    const receivedAt = Date.now();
+    state.peerResultsBySession.set(peerSessionKey(session), { result: result, receivedAt: receivedAt });
+    state.peerResult = result;
+    state.peerResultReceivedAt = receivedAt;
+    return result;
+  }
 
+  async function requestPeerStatuses(source, coordinated) {
+    if (state.peerFetching || state.fetching || (state.refreshCycleRunning && !coordinated)) return;
+    const sessions = asArray(asObject(asObject(state.status).diagnostics).peer_sessions)
+      .map(asObject)
+      .filter(function (session) { return String(session.service || "") === "mpp_outbound"; });
+    const uniqueSessions = Array.from(new Map(sessions.map(function (session) {
+      return [peerSessionKey(session), session];
+    })).values());
+    if (uniqueSessions.length === 0) return;
+
+    state.peerFetching = true;
+    elements.peerRequestState.setAttribute("aria-live", source === "manual" ? "polite" : "off");
+    updateRefreshControls();
+    elements.peerRequestState.className = "inline-status is-loading";
+    elements.peerRequestState.textContent = "Refreshing " + uniqueSessions.length + " outbound peer sessions";
+    const authenticationGeneration = state.authenticationGeneration;
+    let received = 0;
+    let failed = 0;
+    try {
+      // Keep one diagnostics request in flight at a time; every current MPP session gets a fresh request.
+      for (const session of uniqueSessions) {
+        if (state.authenticationRequired || authenticationGeneration !== state.authenticationGeneration) break;
+        try {
+          const result = await requestPeerStatusForSession(session);
+          if (!result) break;
+          received += 1;
+          renderSelectedPeerResult();
+        } catch (error) {
+          failed += 1;
+          if (error instanceof HttpError && error.status === 401 && authenticationGeneration === state.authenticationGeneration) {
+            handleUnauthorized("Authentication required for peer diagnostics");
+            break;
+          }
+        }
+      }
+      elements.peerRequestState.className = failed > 0 ? "inline-status is-error" : "inline-status";
+      elements.peerRequestState.textContent = received + "/" + uniqueSessions.length + " outbound peer sessions refreshed";
+      if (source === "manual") announce(elements.peerRequestState.textContent);
+    } finally {
+      state.peerFetching = false;
+      if (state.status) renderDiagnostics();
+      updateRefreshControls();
+      runPendingAuthenticationRefresh();
+    }
+  }
+
+  async function requestPeerStatus(source, coordinated) {
+    if (state.peerFetching || state.fetching || (state.refreshCycleRunning && !coordinated)) return;
+    const session = selectedPeerSession();
+    if (!session) return;
     state.peerFetching = true;
     elements.peerRequestState.setAttribute("aria-live", source === "manual" ? "polite" : "off");
     updateRefreshControls();
@@ -2580,13 +2880,8 @@
     elements.peerRequestState.textContent = "Requesting current peer path status";
     const authenticationGeneration = state.authenticationGeneration;
     try {
-      const result = await requestJson(PEER_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      state.peerResult = result;
-      state.peerResultReceivedAt = Date.now();
+      const result = await requestPeerStatusForSession(session);
+      if (!result) return;
       elements.peerRequestState.className = "inline-status";
       elements.peerRequestState.textContent = "Peer response received " +
         formatResidenceRelative(peerResultResidenceMs(result));
@@ -3193,12 +3488,6 @@
       function () { if (state.status) renderPaths(); }
     );
     bindSortableTable(
-      elements.overviewPeerPathsBody,
-      "overview-peer-paths",
-      PEER_PATH_SORT_COLUMNS,
-      function () { if (state.status) renderSelectedPeerResult(); }
-    );
-    bindSortableTable(
       elements.peerPathsBody,
       "peer-path-status",
       PEER_PATH_SORT_COLUMNS,
@@ -3257,6 +3546,9 @@
       state.authenticationGeneration += 1;
       state.authenticationRefreshPending = true;
       state.authenticationRequired = false;
+      state.peerResultsBySession.clear();
+      state.peerResult = null;
+      state.peerResultReceivedAt = 0;
       closeAuthDialog();
       runPendingAuthenticationRefresh();
     });

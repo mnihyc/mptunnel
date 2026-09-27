@@ -308,6 +308,7 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains("state.health && state.health.degraded"));
     assert!(DASHBOARD_JS.contains("await refreshDashboard(\"poll\");"));
     assert!(DASHBOARD_JS.contains("await requestPeerStatus(source, true);"));
+    assert!(DASHBOARD_JS.contains("await requestPeerStatuses(source, true);"));
     assert!(DASHBOARD_JS.contains("function peerSurfaceVisible()"));
     assert!(DASHBOARD_JS.contains("state.refreshTimer = window.setTimeout(async function ()"));
     assert!(DASHBOARD_JS.contains("state.refreshIntervalMs !== 0"));
@@ -329,7 +330,7 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
         r#"id="tun-l3-services-count""#,
         r#"id="admission-body""#,
         r#"id="overview-paths-body""#,
-        r#"id="overview-peer-paths-body""#,
+        r#"id="overview-peer-path-groups""#,
         r#"id="overview-peer-allow-badge""#,
         r#"id="chart-mode-speed""#,
         r#"id="chart-mode-total""#,
@@ -460,8 +461,8 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
         r#""cell-secondary cell-mono", formatSessionId(path.session_id)"#,
         r#"appendCell(row, "Session", formatSessionId(session.session_id), "cell-mono");"#,
         r#"" / Session " + formatSessionId(session.session_id)"#,
-        r#"serviceLabel(selectedSession) + " / " + formatSessionId(selectedSession.session_id)"#,
-        r#"serviceLabel(result) + " / " + formatSessionId(result.session_id) + " / ""#,
+        r#""Session " + formatSessionId(group.sessions[0].session_id)"#,
+        r#""Session " + formatSessionId(sessionId)"#,
         r#"appendMetric(elements.peerResultSummary, "Session", formatSessionId(result.session_id));"#,
     ] {
         assert!(
@@ -470,9 +471,9 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
         );
     }
     for raw_session_identity in [
-        r#"return String(session.service) + ":" + String(session.service_name) + ":" + String(session.session_id);"#,
-        r#"String(result.session_id) === String(session.session_id)"#,
-        r#"String(state.peerResult.session_id) === String(selectedSession.session_id)"#,
+        "JSON.stringify([session.service, session.service_index, session.service_name, session.session_id]",
+        "peerSessionKey(result) === peerSessionKey(session)",
+        "peerSessionKey(state.peerResult) === peerSessionKey(session)",
         "session_id: session.session_id",
     ] {
         assert!(
@@ -516,7 +517,7 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
         .expect("end of local path row renderer")
         .0;
     let peer_row = DASHBOARD_JS
-        .split_once("function appendPeerPathRow(body, pathValue, result, qualityValue)")
+        .split_once("function appendPeerPathRow(body, pathValue, result, qualityValue, sessionId)")
         .expect("peer path row renderer")
         .1
         .split_once("function renderPeerPaths")
@@ -608,7 +609,7 @@ fn dashboard_path_sorting_is_numeric_stable_and_table_local() {
     for table_key in [
         "overview-paths",
         "path-inventory",
-        "overview-peer-paths",
+        "overview-peer-outbound:",
         "peer-path-status",
     ] {
         assert!(

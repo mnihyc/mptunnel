@@ -1867,14 +1867,18 @@ where
                 ciphertext_len,
             ));
         }
-        state.ciphertext.resize(ciphertext_len, 0);
+        if state.ciphertext.len() < ciphertext_len {
+            state.ciphertext.resize(ciphertext_len, 0);
+        }
         #[cfg(test)]
         if TRACK_METRICS {
             state.peak_ciphertext_capacity = state
                 .peak_ciphertext_capacity
                 .max(state.ciphertext.capacity());
         }
-        stream.read_exact(&mut state.ciphertext).await?;
+        stream
+            .read_exact(&mut state.ciphertext[..ciphertext_len])
+            .await?;
         let output_remaining = output.len() - output_offset;
         if DIRECT_RECORDS && ciphertext_len <= output_remaining {
             // Snow's ring resolver decrypts in place when the output can hold
@@ -1886,7 +1890,7 @@ where
             let plaintext_len = read_noise_message(
                 transport,
                 nonce,
-                &state.ciphertext,
+                &state.ciphertext[..ciphertext_len],
                 &mut output[output_offset..direct_end],
             )?;
             output_offset += plaintext_len;
@@ -1905,8 +1909,12 @@ where
                     .peak_plaintext_capacity
                     .max(state.plaintext.capacity());
             }
-            let plaintext_len =
-                read_noise_message(transport, nonce, &state.ciphertext, &mut state.plaintext)?;
+            let plaintext_len = read_noise_message(
+                transport,
+                nonce,
+                &state.ciphertext[..ciphertext_len],
+                &mut state.plaintext,
+            )?;
             state.plaintext.truncate(plaintext_len);
             state.plaintext_offset = 0;
         }
@@ -1933,25 +1941,25 @@ where
     }
 
     state.poisoned = true;
-    state.wire.clear();
+    let mut active_len = 0;
     for chunk in plaintext.chunks(TCP_NOISE_MAX_PLAINTEXT) {
         let nonce = state.nonce;
         let next_nonce = nonce
             .checked_add(1)
             .ok_or(EncryptedFramedTransportError::NoiseNonceExhausted)?;
-        let record_start = state.wire.len();
-        state.wire.resize(
-            record_start + TCP_NOISE_MASKED_LENGTH_LEN + chunk.len() + TCP_NOISE_TAG_LEN,
-            0,
-        );
+        let record_start = active_len;
+        let record_capacity_end =
+            record_start + TCP_NOISE_MASKED_LENGTH_LEN + chunk.len() + TCP_NOISE_TAG_LEN;
+        if state.wire.len() < record_capacity_end {
+            state.wire.resize(record_capacity_end, 0);
+        }
         let ciphertext_len = write_noise_message(
             transport,
             nonce,
             chunk,
-            &mut state.wire[record_start + TCP_NOISE_MASKED_LENGTH_LEN..],
+            &mut state.wire[record_start + TCP_NOISE_MASKED_LENGTH_LEN..record_capacity_end],
         )?;
         let record_end = record_start + TCP_NOISE_MASKED_LENGTH_LEN + ciphertext_len;
-        state.wire.truncate(record_end);
         let ciphertext_len = u16::try_from(ciphertext_len)
             .map_err(|_| EncryptedFramedTransportError::InvalidNoiseRecordLength(ciphertext_len))?;
         let encoded_len = masked_length(
@@ -1962,9 +1970,10 @@ where
         );
         state.wire[record_start..record_start + TCP_NOISE_MASKED_LENGTH_LEN]
             .copy_from_slice(&encoded_len.to_be_bytes());
+        active_len = record_end;
         state.nonce = next_nonce;
     }
-    stream.write_all(&state.wire).await?;
+    stream.write_all(&state.wire[..active_len]).await?;
     state.poisoned = false;
     Ok(())
 }

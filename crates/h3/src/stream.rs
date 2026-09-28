@@ -15,7 +15,7 @@ use crate::{
     error::{internal_error::InternalConnectionError, Code},
     frame::FrameStream,
     proto::{
-        coding::{Decode as _, Encode},
+        coding::Encode,
         frame::{encode_data_frame_header, Frame, Settings},
         stream::StreamType,
         varint::VarInt,
@@ -413,9 +413,9 @@ where
                 Err(StreamErrorIncoming::StreamTerminated { error_code }) => {
                     Some(StreamEnd::Reset(error_code))
                 }
-                Err(StreamErrorIncoming::Unknown(err)) => {
+                Err(StreamErrorIncoming::Unknown(_err)) => {
                     #[cfg(feature = "tracing")]
-                    tracing::error!("Unknown error when reading stream {}", err);
+                    tracing::error!("Unknown error when reading stream {}", _err);
 
                     Some(StreamEnd::Other)
                 }
@@ -451,7 +451,15 @@ where
             // TODO create a test for the StreamEnd Option
             // If the stream ended or reset directly after the type was received
             // can we poll data again?
-            let (var, _) = ready!(self.poll_next_varint(cx))?;
+            let (var, end) = ready!(self.poll_next_varint(cx))?;
+            if let Some(StreamEnd::Reset(error_code)) = end {
+                // The reset reason is not an H3 error for a stream that closes
+                // after the type varint, but retain it for trace diagnostics.
+                #[cfg(feature = "tracing")]
+                tracing::trace!("peer reset stream after type varint: {}", error_code);
+                #[cfg(not(feature = "tracing"))]
+                let _ = error_code;
+            }
             let ty = StreamType::from_value(var.0);
             self.ty = Some(ty);
         }
@@ -462,7 +470,16 @@ where
             Some(StreamType::PUSH | StreamType::WEBTRANSPORT_UNI)
         ) && self.id.is_none()
         {
-            let (var, _) = ready!(self.poll_next_varint(cx))?;
+            let (var, end) = ready!(self.poll_next_varint(cx))?;
+            if let Some(StreamEnd::Reset(error_code)) = end {
+                #[cfg(feature = "tracing")]
+                tracing::trace!(
+                    "peer reset stream after identifier varint: {}",
+                    error_code
+                );
+                #[cfg(not(feature = "tracing"))]
+                let _ = error_code;
+            }
             self.id = Some(var);
         }
 

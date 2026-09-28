@@ -1,14 +1,15 @@
-# Exhaustive configuration reference with one runnable common-client profile.
-# Active values expose local SOCKS5 and HTTP CONNECT through one TCP/QUIC MPP
-# peer. Commented blocks cover every other supported TOML shape without
-# opening extra listeners. Create the referenced credential and transport-secret
-# files, replace the example endpoint and TLS material, then run:
+# Exhaustive annotated configuration reference. Every configuration line is
+# commented, so this document is not a runnable all-in-one profile. Start from
+# the minimal client.toml or server.toml profile and copy the relevant blocks
+# and values from here. Create the referenced credential and transport-secret
+# files and replace example endpoints and TLS material in the profile you build.
+# Validate that completed profile with:
 #
 #   mptunnel --config ./config.toml --check-config
 #
-# Minimal client and server profiles live in ./examples. Unknown TOML keys are
-# rejected. `mptunnel platform` reports host integration support; it is a
-# command, not a TOML setting.
+# Runnable minimal client and server profiles live in ./examples. Unknown TOML
+# keys are rejected. `mptunnel platform` reports host integration support; it
+# is a command, not a TOML setting.
 #
 # Vocabulary used throughout this reference:
 # - target: the application destination requested by a client;
@@ -27,18 +28,18 @@
 # Unix seconds and therefore requires a whole number. Legacy millisecond and
 # long-form unit keys are intentionally not accepted.
 
-check_config = false
+# check_config = false
 # Prefer the `--check-config` command-line flag for one-time validation. This
 # persistent field exists for service integrations that can only supply a file.
 
 # Process logging stays outside the forwarding data path. Relative file paths are
 # resolved beside this document; parent directories must already exist.
-[logging]
-level = "info"          # off, error, warn, info, or debug
-format = "text"         # text or newline-delimited json
-console = true          # standard error
+# [logging]
+# level = "info"          # off, error, warn, info, or debug
+# format = "text"         # text or newline-delimited json
+# console = true          # standard error
 # file = "logs/mptunnel.log"
-flow_events = false     # opt-in destination-bearing flow open/close records
+# flow_events = false     # opt-in destination-bearing flow open/close records
 # `debug` adds a correlated trace for each routed L4 connection or UDP
 # association. Every stage repeats immutable inbound/principal/request context;
 # MPP ingress adds the typed opening carrier peer and session/path identity.
@@ -78,10 +79,10 @@ flow_events = false     # opt-in destination-bearing flow open/close records
 # - `tls_private_key`: exactly one unencrypted PKCS#1, SEC1, or PKCS#8 PEM key.
 # Global credentials use protocol credential and principal identities. Each
 # MPP outbound uses `credential_id`; an MPP inbound accepts `credential_ids`.
-[[credentials]]
-credential_id = "home-client"
-principal_id = "home"
-secret = { from = "file", path = "mpp-credential.key" }
+# [[credentials]]
+# credential_id = "home-client"
+# principal_id = "home"
+# secret = { from = "file", path = "mpp-credential.key" }
 # expires_at_unix_s = 1798761600
 # revoked = false
 # revocation_grace_s = 30
@@ -100,21 +101,21 @@ secret = { from = "file", path = "mpp-credential.key" }
 # username = "mobile-user"
 # password = { from = "file", path = "local-proxy-password.key" }
 
-[service]
+# [service]
 # Supervision owns process generations, never MPP session state.
-supervise = false
-restart_backoff_s = 1
-restart_max_backoff_s = 30
+# supervise = false
+# restart_backoff_s = 1
+# restart_max_backoff_s = 30
 # Omit max_restarts for unlimited in-process restart attempts.
-max_restarts = 10
+# max_restarts = 10
 
-[session]
+# [session]
 # Established streams survive a complete carrier outage for five minutes.
 # The same absolute ceiling bounds graceful TCP carrier retirement.
 # Healthy idle streams with an authenticated carrier do not consume it.
-retention_timeout_s = 300
+# retention_timeout_s = 300
 
-[flow]
+# [flow]
 # Product TCP streams and UDP associations retire after this many seconds with
 # no reliable-stream bytes or fresh application datagram in either direction;
 # an accepted zero-length datagram is still activity. TCP FIN, zero-length
@@ -168,20 +169,20 @@ retention_timeout_s = 300
 # MPP-L3 inherits these `[flow]` defaults because it has no per-node table.
 # quic_loss_compensation_percent = 20
 
-[management]
+# [management]
 # The API is disabled while listen is empty. To enable it, replace listen with
 # one or more loopback addresses and reference a separate 16..=256 byte
 # visible-ASCII operator-token file. Dashboard serving requires the API. The
 # public HTTP surface is API v4 only, rooted at `/api/v4/`; older API paths are
 # intentionally unsupported.
-listen = []
+# listen = []
 # token = { from = "file", path = "management-token.key" }
-dashboard = false
+# dashboard = false
 # Process-wide override for incoming peer diagnostics. `true` permits every
 # authenticated MPP peer on every MPP endpoint, even when the endpoint-specific
 # option or principal selector below denies it. It does not weaken MPP
 # authentication and is independent of whether the local HTTP API is enabled.
-allow_peer_diagnostics = false
+# allow_peer_diagnostics = false
 # With a nonempty listener and token, this file is also the operator profile:
 #   mptunnel --config ./config.toml status
 #   mptunnel --config ./config.toml dns status
@@ -190,17 +191,17 @@ allow_peer_diagnostics = false
 # runtime. Their typed inputs and exit behavior are documented at:
 # https://github.com/mnihyc/mptunnel/blob/main/docs/OPERATIONS.md
 
-[resources]
+# [resources]
 # These are bounded capacity envelopes. Live transport metrics choose paths and
 # scheduling; these values do not select a fixed latency or bulk mode.
-max_frame_bytes = 1048576
-max_payload_bytes = 1048512
-max_ack_ranges = 256
-max_paths = 64
-max_streams = 65536
+# max_frame_bytes = 1048576
+# max_payload_bytes = 1048512
+# max_ack_ranges = 256
+# max_paths = 64
+# max_streams = 65536
 # Native requests: two per reliable QUIC attachment plus carrier control.
 # An explicit smaller value remains a native ceiling, not a logical-flow count.
-max_quic_concurrent_bidi_streams = 131073
+# max_quic_concurrent_bidi_streams = 131073
 # Maximum retained loss-reclassification metadata per native QUIC path, in
 # bytes. This independent 64 MiB ceiling is not allocated in advance and does
 # not follow max_path_flight_bytes or reserve payload capacity. Finalized loss
@@ -210,24 +211,24 @@ max_quic_concurrent_bidi_streams = 131073
 # discarded. A new native path starts fresh with this same configured ceiling.
 # Zero permits no journal: its first reservation enters raw-only operation.
 # Omission uses the value shown here.
-max_quic_loss_journal_bytes = 67108864
-max_stream_window_bytes = 67108864
-max_repair_bytes = 67108864
-max_reorder_bytes = 67108864
-max_reinjection_cache_chunks = 65536
-max_reorder_buffer_chunks = 65536
-max_retained_receive_ranges = 65536
-max_datagram_queue_bytes = 16777216
-max_path_flight_bytes = 67108864
-max_reliable_relay_chunk_bytes = 524288
+# max_quic_loss_journal_bytes = 67108864
+# max_stream_window_bytes = 67108864
+# max_repair_bytes = 67108864
+# max_reorder_bytes = 67108864
+# max_reinjection_cache_chunks = 65536
+# max_reorder_buffer_chunks = 65536
+# max_retained_receive_ranges = 65536
+# max_datagram_queue_bytes = 16777216
+# max_path_flight_bytes = 67108864
+# max_reliable_relay_chunk_bytes = 524288
 
 # TCP record heartbeats and native QUIC liveness are separate carrier
 # mechanisms. The interval is the maximum idle delay; clients renew each idle
 # probe within 80%-100% of it. Both remain below logical session retention.
-tcp_path_heartbeat_interval_s = 10
-tcp_path_heartbeat_timeout_s = 30
-quic_path_keep_alive_interval_s = 10
-quic_path_idle_timeout_s = 30
+# tcp_path_heartbeat_interval_s = 10
+# tcp_path_heartbeat_timeout_s = 30
+# quic_path_keep_alive_interval_s = 10
+# quic_path_idle_timeout_s = 30
 
 # New-flow admission is a separate limit applied while a flow opens. These
 # limits do not derive from, resize, or feed MPP path/session/stream/queue budgets.
@@ -237,15 +238,15 @@ quic_path_idle_timeout_s = 30
 # work; outbound connects, target connects, and DNS work are independent
 # subsets and cannot exceed it. A connecting flow also holds its applicable
 # live-flow permits. Every value is 1..=1000000.
-[admission]
-max_live_flows = 4096
-max_concurrent_work = 4096
-max_live_flows_per_principal = 4096
-max_live_flows_per_outbound = 4096
-max_connects_per_outbound = 4096
-max_live_flows_per_target = 4096
-max_connects_per_target = 4096
-max_dns_work = 4096
+# [admission]
+# max_live_flows = 4096
+# max_concurrent_work = 4096
+# max_live_flows_per_principal = 4096
+# max_live_flows_per_outbound = 4096
+# max_connects_per_outbound = 4096
+# max_live_flows_per_target = 4096
+# max_connects_per_target = 4096
+# max_dns_work = 4096
 
 # DNS consists of named servers, policies, override records, and synthetic
 # captures. Records and captures have no effect until attached to a selected
@@ -254,8 +255,8 @@ max_dns_work = 4096
 # `[dns].default` is used when no rule matches. Omitting `[dns]` creates a
 # `system` server and a `default` policy. The active example names that policy
 # `system` explicitly.
-[dns]
-default = "system"
+# [dns]
+# default = "system"
 
 # `protocol = "system"` delegates to the operating-system resolver and accepts
 # no address, TLS name, HTTP path, or routed outbound. Every network protocol
@@ -263,9 +264,9 @@ default = "system"
 # recursive DNS. Unspecified, multicast, and IPv4 broadcast addresses are
 # rejected. Bracket an IPv6 address. The protocols are system, udp, tcp,
 # udp-tcp, dot, doh, and doq.
-[[dns.servers]]
-name = "system"
-protocol = "system"
+# [[dns.servers]]
+# name = "system"
+# protocol = "system"
 
 # Plain DNS server forms. `udp-tcp` retries a truncated UDP response over TCP.
 # [[dns.servers]]
@@ -367,17 +368,17 @@ protocol = "system"
 # `query.timeout_s`; zero starts all at once. A nonempty `answer_cidrs` accepts
 # a response only when every A/AAAA address is inside at least one of at most
 # 256 unique listed networks.
-[[dns.policies]]
-name = "system"
-servers = ["system"]
-family = "ipv4-and-ipv6"
-security = "allow-plaintext"
-strategy = "ordered"
-answer_cidrs = []
-override_records = []
+# [[dns.policies]]
+# name = "system"
+# servers = ["system"]
+# family = "ipv4-and-ipv6"
+# security = "allow-plaintext"
+# strategy = "ordered"
+# answer_cidrs = []
+# override_records = []
 # synthetic_capture = "vpn-capture"
-query = { timeout_s = 5, inflight = 64, answers = 64 }
-cache = { entries = 4096, positive_ttl_s = 300, negative_ttl_s = 30, stale_s = 30, prefetch_s = 30 }
+# query = { timeout_s = 5, inflight = 64, answers = 64 }
+# cache = { entries = 4096, positive_ttl_s = 300, negative_ttl_s = 30, stale_s = 30, prefetch_s = 30 }
 # `query.timeout_s` is the complete deadline for each A or AAAA lookup across
 # that policy's servers. Its range is 0.001..=60 seconds; `query.inflight` is
 # 1..=1024 and `query.answers` is 1..=64. `cache.entries` is 0..=65536.
@@ -423,17 +424,17 @@ cache = { entries = 4096, positive_ttl_s = 300, negative_ttl_s = 30, stale_s = 3
 # listen = ["127.0.0.1:1080"]
 # local_users = ["phone-login"]
 #
-[[inbounds]]
-name = "local-socks"
-protocol = "socks5"
+# [[inbounds]]
+# name = "local-socks"
+# protocol = "socks5"
 # Repeat addresses for explicit IPv4/IPv6 listeners, for example
 # listen = ["127.0.0.1:1080", "[::1]:1080"]. An empty list defaults to IPv4
 # loopback port 1080.
-listen = ["127.0.0.1:1080"]
+# listen = ["127.0.0.1:1080"]
 # New flows are assigned by the ordered rules in `[routing]` below.
 # local_users = ["phone-login"]
 
-[inbounds.admission]
+# [inbounds.admission]
 # Listener admission precedes Product routing/admission and does not derive
 # from MPP resource limits. `max_connections` is the listener-wide accepted
 # socket count. The source and principal ceilings are independent dimensions;
@@ -441,16 +442,16 @@ listen = ["127.0.0.1:1080"]
 # and the `anonymous` principal, so their defaults match the listener ceiling.
 # The handshake deadline covers proxy negotiation/authentication only. Once a
 # Product flow opens, `[flow].idle_timeout_s` owns its payload-idle lifetime.
-max_connections = 4096
-max_connections_per_source = 4096
-max_connections_per_principal = 4096
-handshake_timeout_s = 10
+# max_connections = 4096
+# max_connections_per_source = 4096
+# max_connections_per_principal = 4096
+# handshake_timeout_s = 10
 
-[[inbounds]]
-name = "local-http"
-protocol = "http-connect"
+# [[inbounds]]
+# name = "local-http"
+# protocol = "http-connect"
 # An empty list defaults to IPv4 loopback port 8080.
-listen = ["127.0.0.1:8080"]
+# listen = ["127.0.0.1:8080"]
 # local_users = ["phone-login"]
 
 # Optional fixed-target local port forwards. Unlike proxy listeners, `listen`
@@ -564,17 +565,17 @@ listen = ["127.0.0.1:8080"]
 # outbound = "edge-mpp"
 # interface_name = "mptun-l3"
 
-[[outbounds]]
-name = "edge-mpp"
-protocol = "mpp"
+# [[outbounds]]
+# name = "edge-mpp"
+# protocol = "mpp"
 # Permit this client to answer a sanitized diagnostics request from its peer.
 # The default is false; the management-global override permits every endpoint.
 # allow_peer_diagnostics = false
 # TCP and QUIC/UDP remain independent carriers under one MPP session.
-paths = [
-  { name = "path-1", endpoint = "tcp://server.example.com:7443" },
-  { name = "path-2", endpoint = "quic://server.example.com:7443" },
-]
+# paths = [
+#   { name = "path-1", endpoint = "tcp://server.example.com:7443" },
+#   { name = "path-2", endpoint = "quic://server.example.com:7443" },
+# ]
 # Grammar: `tcp://HOST:PORT[-END]` or `quic://HOST:PORT[-END]`, followed by an
 # optional `?KEY=VALUE&...` query. IPv6 literals require brackets, for example
 # `quic://[2001:db8::10]:7443`. Ports are canonical decimal 1..=65535 without
@@ -638,8 +639,8 @@ paths = [
 # Complete examples:
 # tcp://192.0.2.10:7443?source-address=192.0.2.20&initial-srtt-s=0.04&initial-rttvar-s=0.005&initial-rate-mbps=100&max-tcp-carriers=3&backup=false&expensive=false&allow-bulk=true&control-only=false&allow-datagrams=true
 # quic://server.example.com:7000-7999?initial-rate=unknown&loss-compensation-percent=10&max-datagram-payload-bytes=1200&port-rotation-interval-s=300&backup=false&expensive=false&allow-bulk=true&control-only=false
-path_probe_interval_s = 10
-path_probe_timeout_s = 2
+# path_probe_interval_s = 10
+# path_probe_timeout_s = 2
 
 # This overrides the directional accepted-Product recovery accounting target;
 # it does not gate Product recovery. QUIC loss compensation separately corrects
@@ -652,22 +653,22 @@ path_probe_timeout_s = 2
 # optional_reinjection_budget_percent = 20 # accepted-recovery accounting target
 # quic_loss_compensation_percent = 20
 
-[outbounds.security]
-credential_id = "home-client"
+# [outbounds.security]
+# credential_id = "home-client"
 # The pinned QUIC and TLS-fallback TCP certificate identity is independent from
 # the MPP credential. Its default is mptunnel.example; the carrier endpoint may
 # be a different DNS name or a literal IP address.
 # tls_server_name = "mptunnel.example"
-tls_pinned_certificate = { from = "file", path = "REPLACE_WITH_SERVER_CERT.pem" }
+# tls_pinned_certificate = { from = "file", path = "REPLACE_WITH_SERVER_CERT.pem" }
 # Endpoint-wide transport protection uses the same raw 32-byte file on both
 # peers. This key is separate from every MPP client credential. Omit the field
 # only when both peers use TLS 1.3 TCP and public QUIC Initials instead.
-transport_secret = { from = "file", path = "mpp-transport.key" }
+# transport_secret = { from = "file", path = "mpp-transport.key" }
 # Direct-paste alternative (`openssl rand -hex 32`); Base64/raw use the same schema:
 # transport_secret = { from = "hex", value = "REPLACE_WITH_64_HEX_DIGITS" }
-auth_freshness_window_s = 300
+# auth_freshness_window_s = 300
 
-[routing]
+# [routing]
 
 # Hostname representation is one node-wide routing choice, shared by local
 # and MPP inbounds:
@@ -677,13 +678,13 @@ auth_freshness_window_s = 300
 #                 the original hostname for a domain-capable outbound
 #   full-resolve - resolve every hostname and pass authorized literal IPs
 # Omission retains the historical demand-driven compatibility behavior for
-# existing configurations. This runnable common-client profile explicitly
-# delegates application-target DNS to the MPP server.
+# existing configurations. This example selects `as-is`, delegating
+# application-target DNS to the MPP server.
 # Resolution mode never changes literal-IP authorization. Private literals
 # require a narrow allow-restricted rule independently on each node that
 # handles them; as-is hostnames bypass CIDR matching only because no local DNS
 # answer exists to match.
-target_resolution = "as-is"
+# target_resolution = "as-is"
 
 # Routing is one ordered, first-match table shared by every L4 local and MPP
 # inbound. A normal rule selects exactly one `outbound` or `balancer`; its
@@ -766,11 +767,11 @@ target_resolution = "as-is"
 # domain_suffix = ["blocked.example"]
 # decision = "reject" # Use "drop" when no application refusal should be sent.
 
-[[routing.rules]]
-name = "default"
-inbounds = ["local-socks", "local-http"]
-outbound = "edge-mpp"
-explanation = "route local proxy traffic through the primary MPP outbound"
+# [[routing.rules]]
+# name = "default"
+# inbounds = ["local-socks", "local-http"]
+# outbound = "edge-mpp"
+# explanation = "route local proxy traffic through the primary MPP outbound"
 
 # When MPTUNNEL has or resolves a literal address, ordinary allow does not
 # authorize loopback, private, link-local, metadata, multicast, or unspecified

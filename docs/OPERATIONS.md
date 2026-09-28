@@ -395,9 +395,10 @@ complete commented shape.
 ### Migrating from 0.4.3 to 0.4.4
 
 Version 0.4.4 intentionally makes configuration durations seconds-only. Start
-from the current `examples/client.toml`, `examples/server.toml`, or exhaustive
-`examples/config.reference.toml`, transfer the deployment's intended values in
-seconds, and validate the rebuilt file; do not mix it with an earlier schema.
+from the current `examples/client.toml` or `examples/server.toml`, copy any
+additional settings from the commented `examples/config.reference.toml`, and
+transfer the deployment's intended values in seconds. Validate the rebuilt file;
+do not mix it with an earlier schema.
 
 - `[flow].idle_timeout_s` defaults to 300 seconds; zero disables payload-idle
   expiry. TCP payload and accepted UDP datagrams refresh it, while transport

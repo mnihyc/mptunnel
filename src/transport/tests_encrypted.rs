@@ -125,6 +125,10 @@ struct PausingBytesReader {
     pause_at: usize,
 }
 
+struct PartialThenPendingWriter {
+    bytes: Vec<u8>,
+}
+
 impl AsyncRead for ChunkedBytesReader {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -162,6 +166,30 @@ impl AsyncRead for PausingBytesReader {
             buf.put_slice(&this.bytes[this.offset..this.offset + count]);
             this.offset += count;
         }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for PartialThenPendingWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.bytes.is_empty() && !buf.is_empty() {
+            this.bytes.push(buf[0]);
+            Poll::Ready(Ok(1))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -236,6 +264,150 @@ async fn capture_noise_transcript(frames: &[Frame]) -> NoiseTranscript {
         read_length_key: server.read.length_key,
         limits,
     }
+}
+
+// Test-only oracle for the former per-write clear/resize policy. It keeps the
+// current framing, Noise, I/O, and decode path intact while allowing the
+// ignored release fixture to compare the complete frame lifecycle.
+async fn write_noise_plaintext_legacy<W>(
+    stream: &mut W,
+    transport: &RwLock<snow::StatelessTransportState>,
+    state: &mut NoiseWriteState,
+    plaintext: &[u8],
+) -> Result<(), EncryptedFramedTransportError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if state.poisoned {
+        return Err(EncryptedFramedTransportError::WriteStatePoisoned);
+    }
+    if plaintext.is_empty() {
+        return Ok(());
+    }
+
+    state.poisoned = true;
+    state.wire.clear();
+    for chunk in plaintext.chunks(TCP_NOISE_MAX_PLAINTEXT) {
+        let nonce = state.nonce;
+        let next_nonce = nonce
+            .checked_add(1)
+            .ok_or(EncryptedFramedTransportError::NoiseNonceExhausted)?;
+        let record_start = state.wire.len();
+        state.wire.resize(
+            record_start + TCP_NOISE_MASKED_LENGTH_LEN + chunk.len() + TCP_NOISE_TAG_LEN,
+            0,
+        );
+        let ciphertext_len = write_noise_message(
+            transport,
+            nonce,
+            chunk,
+            &mut state.wire[record_start + TCP_NOISE_MASKED_LENGTH_LEN..],
+        )?;
+        let record_end = record_start + TCP_NOISE_MASKED_LENGTH_LEN + ciphertext_len;
+        state.wire.truncate(record_end);
+        let ciphertext_len = u16::try_from(ciphertext_len)
+            .map_err(|_| EncryptedFramedTransportError::InvalidNoiseRecordLength(ciphertext_len))?;
+        let encoded_len = masked_length(
+            &state.length_key,
+            b"mptunnel noise record header v1",
+            &nonce.to_be_bytes(),
+            ciphertext_len,
+        );
+        state.wire[record_start..record_start + TCP_NOISE_MASKED_LENGTH_LEN]
+            .copy_from_slice(&encoded_len.to_be_bytes());
+        state.nonce = next_nonce;
+    }
+    stream.write_all(&state.wire).await?;
+    state.poisoned = false;
+    Ok(())
+}
+
+async fn write_noise_frames_legacy<W>(
+    stream: &mut W,
+    transport: &RwLock<snow::StatelessTransportState>,
+    state: &mut NoiseWriteState,
+    limits: CodecLimits,
+    frames: &[Frame],
+    encode_buffer: &mut Vec<u8>,
+) -> Result<(), EncryptedFramedTransportError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if frames.is_empty() {
+        return Ok(());
+    }
+    #[cfg(feature = "lab-diagnostics")]
+    let total_started = std::time::Instant::now();
+    encode_buffer.clear();
+    for frame in frames {
+        encode_frame_into(frame, limits, encode_buffer)?;
+    }
+    write_noise_plaintext_legacy(stream, transport, state, encode_buffer).await?;
+    #[cfg(feature = "lab-diagnostics")]
+    lab_perf_record(
+        "transport.tcp.noise_write_frames_total",
+        total_started.elapsed(),
+        encode_buffer.len(),
+    );
+    Ok(())
+}
+
+async fn noise_stream_pair(
+    capacity: usize,
+) -> (
+    NoiseFramedStream<tokio::io::DuplexStream>,
+    NoiseFramedStream<tokio::io::DuplexStream>,
+) {
+    let (client, server) = transport_secret_pair(capacity).await;
+    let EncryptedFramedStreamInner::Noise(client) = client.inner else {
+        panic!("Noise fixture client");
+    };
+    let EncryptedFramedStreamInner::Noise(server) = server.inner else {
+        panic!("Noise fixture server");
+    };
+    (client, server)
+}
+
+async fn run_noise_frame_lifecycle<const LEGACY_WRITER: bool>(
+    client: &mut NoiseFramedStream<tokio::io::DuplexStream>,
+    server: &mut NoiseFramedStream<tokio::io::DuplexStream>,
+    frames: &[Frame],
+    iterations: usize,
+    validate: bool,
+) -> std::time::Duration {
+    use std::hint::black_box;
+
+    let started = std::time::Instant::now();
+    let mut decoded = 0usize;
+    for _ in 0..iterations {
+        for frame in frames {
+            if LEGACY_WRITER {
+                write_noise_frames_legacy(
+                    &mut client.stream,
+                    &client.transport,
+                    &mut client.write,
+                    client.limits,
+                    std::slice::from_ref(frame),
+                    &mut client.encode_buffer,
+                )
+                .await
+                .expect("legacy lifecycle frame write");
+            } else {
+                client
+                    .write_frames(std::slice::from_ref(frame))
+                    .await
+                    .expect("reused lifecycle write");
+            }
+            let received = server.read_frame().await.expect("lifecycle decode");
+            if validate {
+                assert_eq!(&received, frame, "Noise lifecycle changed decoded frame");
+            }
+            decoded = decoded.wrapping_add(std::mem::size_of_val(&received));
+            black_box(received);
+        }
+    }
+    black_box(decoded);
+    started.elapsed()
 }
 
 async fn run_noise_read_fixture<const DIRECT: bool, const TRACK_METRICS: bool>(
@@ -1061,6 +1233,138 @@ async fn canceled_noise_record_read_retains_existing_poison_contract() {
 }
 
 #[tokio::test]
+async fn noise_writer_reuses_high_water_storage_without_sending_stale_suffix() {
+    let (client_io, server_io) = duplex(128 * 1024);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let client_io = CaptureWrites {
+        inner: client_io,
+        bytes: captured.clone(),
+    };
+    let client_config = test_client_tls_config_with_transport_secret([0x5a; 32]);
+    let server_config = test_server_tls_config_with_transport_secret([0x5a; 32]);
+    let limits = CodecLimits::default();
+    let (client, server) = tokio::join!(
+        EncryptedFramedStream::connect(client_io, &client_config, limits),
+        EncryptedFramedStream::accept(server_io, &server_config, limits),
+    );
+    let EncryptedFramedStreamInner::Noise(mut client) = client.expect("Noise client").inner else {
+        panic!("fixture requires Noise client");
+    };
+    let EncryptedFramedStreamInner::Noise(mut server) = server.expect("Noise server").inner else {
+        panic!("fixture requires Noise server");
+    };
+    captured.lock().expect("captured wire").clear();
+
+    let long = Frame::StreamData {
+        stream_id: StreamId(84),
+        offset: 0,
+        payload: Bytes::from(vec![0x5c; 32 * 1024]),
+    };
+    let short = Frame::Ping { nonce: 0x1234 };
+    let long_plaintext = crate::protocol::codec::encode_frames(std::slice::from_ref(&long), limits)
+        .expect("encode long fixture");
+    let short_plaintext =
+        crate::protocol::codec::encode_frames(std::slice::from_ref(&short), limits)
+            .expect("encode short fixture");
+    let expected_high_water =
+        long_plaintext.len() + TCP_NOISE_MASKED_LENGTH_LEN + TCP_NOISE_TAG_LEN;
+    let expected_ciphertext_high_water = long_plaintext.len() + TCP_NOISE_TAG_LEN;
+
+    for frame in [&long, &short, &long] {
+        let plaintext = crate::protocol::codec::encode_frames(std::slice::from_ref(frame), limits)
+            .expect("encode fixture frame");
+        let expected_wire_len = plaintext.len() + TCP_NOISE_MASKED_LENGTH_LEN + TCP_NOISE_TAG_LEN;
+        client
+            .write_frames(std::slice::from_ref(frame))
+            .await
+            .expect("write fixture frame");
+        let observed_wire = {
+            let mut captured = captured.lock().expect("captured wire");
+            std::mem::take(&mut *captured)
+        };
+        assert_eq!(
+            observed_wire.len(),
+            expected_wire_len,
+            "each call must write only its own encrypted prefix"
+        );
+        assert_eq!(client.write.wire.len(), expected_high_water);
+        assert_eq!(server.read_frame().await.expect("decode fixture"), *frame);
+        assert_eq!(
+            server.read.ciphertext.len(),
+            expected_ciphertext_high_water,
+            "short records must not shrink the reader's initialized high-water buffer"
+        );
+    }
+    assert!(long_plaintext.len() > short_plaintext.len());
+
+    // Advance to the test rekey boundary with ordinary records, then reuse the
+    // high-water buffer for a large record whose nonce forces outgoing rekey.
+    for nonce in 0..(TCP_NOISE_REKEY_RECORD_INTERVAL - 3) {
+        let frame = Frame::Ping { nonce };
+        client
+            .write_frames(std::slice::from_ref(&frame))
+            .await
+            .expect("write pre-rekey ping");
+        assert_eq!(
+            server.read_frame().await.expect("read pre-rekey ping"),
+            frame
+        );
+    }
+    assert_eq!(client.write.nonce, TCP_NOISE_REKEY_RECORD_INTERVAL);
+    let rekey_frame = Frame::StreamData {
+        stream_id: StreamId(84),
+        offset: 32 * 1024,
+        payload: Bytes::from(vec![0x6d; 32 * 1024]),
+    };
+    client
+        .write_frames(std::slice::from_ref(&rekey_frame))
+        .await
+        .expect("write across rekey boundary");
+    assert_eq!(client.write.wire.len(), expected_high_water);
+    assert_eq!(
+        server
+            .read_frame()
+            .await
+            .expect("read across rekey boundary"),
+        rekey_frame
+    );
+}
+
+#[tokio::test]
+async fn canceled_partial_noise_write_remains_poisoned() {
+    let transcript = capture_noise_transcript(&[]).await;
+    let mut writer = PartialThenPendingWriter { bytes: Vec::new() };
+    let mut state = NoiseWriteState::new([0x61; 32]);
+    let plaintext = b"partial encrypted record";
+    let mut write = Box::pin(write_noise_plaintext(
+        &mut writer,
+        &transcript.transport,
+        &mut state,
+        plaintext,
+    ));
+    std::future::poll_fn(|cx| match std::future::Future::poll(write.as_mut(), cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(result) => panic!("partial writer completed unexpectedly: {result:?}"),
+    })
+    .await;
+    drop(write);
+    assert_eq!(writer.bytes.len(), 1, "fixture emits only a partial record");
+    assert!(
+        state.poisoned,
+        "cancellation after partial output poisons writer"
+    );
+    assert!(matches!(
+        write_noise_plaintext(&mut writer, &transcript.transport, &mut state, plaintext,).await,
+        Err(EncryptedFramedTransportError::WriteStatePoisoned)
+    ));
+    assert_eq!(
+        writer.bytes.len(),
+        1,
+        "poisoned retry sends no stale suffix"
+    );
+}
+
+#[tokio::test]
 async fn noise_rekeys_both_directions_during_full_duplex_traffic() {
     let (client, server) = transport_secret_pair(64 * 1024).await;
     let (mut client_reader, mut client_writer) = client.split().expect("split client");
@@ -1103,6 +1407,163 @@ async fn noise_rekeys_both_directions_during_full_duplex_traffic() {
             }
         }
     );
+}
+
+/// Counterbalanced release-mode comparison of the complete Noise TCP frame
+/// lifecycle. The baseline oracle restores the former per-write wire clear
+/// and resize policy; both arms still encode Frames, encrypt/write records,
+/// decrypt/read records, and decode Frames. Run with
+/// `cargo test --release noise_writer_buffer_reuse_full_frame_lifecycle_cost -- --ignored --nocapture --test-threads=1`.
+/// This unit-test build rekeys every 8 records; production rekeys every
+/// 1,048,576 records. These timings compare buffer policies under the test
+/// profile and are not production CPU estimates.
+#[tokio::test]
+#[ignore = "manual release-mode Noise frame lifecycle buffer comparison"]
+async fn noise_writer_buffer_reuse_full_frame_lifecycle_cost() {
+    let cases = [
+        ("short", vec![Frame::Ping { nonce: 7 }], 32_768usize),
+        (
+            "large",
+            vec![Frame::StreamData {
+                stream_id: StreamId(85),
+                offset: 0,
+                payload: Bytes::from(vec![0x72; 32 * 1024]),
+            }],
+            4_096,
+        ),
+        (
+            "alternating",
+            vec![
+                Frame::Ping { nonce: 9 },
+                Frame::StreamData {
+                    stream_id: StreamId(86),
+                    offset: 0,
+                    payload: Bytes::from(vec![0x39; 8 * 1024]),
+                },
+            ],
+            4_096,
+        ),
+    ];
+
+    for (name, frames, iterations) in cases {
+        let (mut reused_client, mut reused_server) = noise_stream_pair(256 * 1024).await;
+        let (mut legacy_client, mut legacy_server) = noise_stream_pair(256 * 1024).await;
+        let mut record_sizes = Vec::with_capacity(frames.len());
+        for frame in &frames {
+            let mut plaintext = Vec::new();
+            encode_frame_into(frame, CodecLimits::default(), &mut plaintext)
+                .expect("encode zero-fill model frame");
+            assert!(
+                plaintext.len() <= TCP_NOISE_MAX_PLAINTEXT,
+                "fixture frame must occupy one Noise record"
+            );
+            record_sizes.push((
+                plaintext.len() + TCP_NOISE_MASKED_LENGTH_LEN + TCP_NOISE_TAG_LEN,
+                plaintext.len() + TCP_NOISE_TAG_LEN,
+            ));
+        }
+        let writer_growth_fill = record_sizes
+            .iter()
+            .map(|(wire, _)| *wire)
+            .max()
+            .unwrap_or_default();
+        let reader_growth_fill = record_sizes
+            .iter()
+            .map(|(_, ciphertext)| *ciphertext)
+            .max()
+            .unwrap_or_default();
+        let legacy_writer_fill_per_iteration =
+            record_sizes.iter().map(|(wire, _)| *wire).sum::<usize>();
+        let mut prior_legacy_reader_len = record_sizes
+            .last()
+            .map(|(_, ciphertext)| *ciphertext)
+            .unwrap_or_default();
+        let mut legacy_reader_fill_per_iteration = 0usize;
+        for (_, ciphertext_len) in &record_sizes {
+            legacy_reader_fill_per_iteration = legacy_reader_fill_per_iteration
+                .saturating_add(ciphertext_len.saturating_sub(prior_legacy_reader_len));
+            prior_legacy_reader_len = *ciphertext_len;
+        }
+
+        // Warm each arm to the scenario's high-water mark and verify actual
+        // frame equality outside the timed intervals.
+        run_noise_frame_lifecycle::<false>(
+            &mut reused_client,
+            &mut reused_server,
+            &frames,
+            1,
+            true,
+        )
+        .await;
+        run_noise_frame_lifecycle::<true>(&mut legacy_client, &mut legacy_server, &frames, 1, true)
+            .await;
+
+        let mut reused_total_ns = 0u128;
+        let mut legacy_total_ns = 0u128;
+        for round in 0..4 {
+            let reused_first = round == 0 || round == 3;
+            let (reused, legacy, order) = if reused_first {
+                let reused = run_noise_frame_lifecycle::<false>(
+                    &mut reused_client,
+                    &mut reused_server,
+                    &frames,
+                    iterations,
+                    false,
+                )
+                .await;
+                let legacy = run_noise_frame_lifecycle::<true>(
+                    &mut legacy_client,
+                    &mut legacy_server,
+                    &frames,
+                    iterations,
+                    false,
+                )
+                .await;
+                (reused, legacy, "reused-first")
+            } else {
+                let legacy = run_noise_frame_lifecycle::<true>(
+                    &mut legacy_client,
+                    &mut legacy_server,
+                    &frames,
+                    iterations,
+                    false,
+                )
+                .await;
+                let reused = run_noise_frame_lifecycle::<false>(
+                    &mut reused_client,
+                    &mut reused_server,
+                    &frames,
+                    iterations,
+                    false,
+                )
+                .await;
+                (reused, legacy, "legacy-first")
+            };
+            reused_total_ns = reused_total_ns.saturating_add(reused.as_nanos());
+            legacy_total_ns = legacy_total_ns.saturating_add(legacy.as_nanos());
+            eprintln!(
+                "noise-wire-lifecycle: case={name} frames_per_iteration={} iterations={iterations} round={} order={order} test_rekey_interval_records={} reused_ms={:.3} legacy_ms={:.3} reused_over_legacy={:.3}",
+                frames.len(),
+                round + 1,
+                TCP_NOISE_REKEY_RECORD_INTERVAL,
+                reused.as_secs_f64() * 1_000.0,
+                legacy.as_secs_f64() * 1_000.0,
+                reused.as_secs_f64() / legacy.as_secs_f64(),
+            );
+        }
+        eprintln!(
+            "noise-wire-lifecycle-pooled: case={name} frames_per_iteration={} iterations={iterations} rounds=4 order=ABBA test_rekey_interval_records={} production_rekey_interval_records={} reused_ns_per_frame={:.1} legacy_ns_per_frame={:.1} reused_over_legacy={:.3} note=policy comparison under test rekey profile, not production CPU estimate",
+            frames.len(),
+            TCP_NOISE_REKEY_RECORD_INTERVAL,
+            1u64 << 20,
+            reused_total_ns as f64 / (iterations * frames.len() * 4) as f64,
+            legacy_total_ns as f64 / (iterations * frames.len() * 4) as f64,
+            reused_total_ns as f64 / legacy_total_ns.max(1) as f64,
+        );
+        eprintln!(
+            "noise-buffer-zero-fill-model: case={name} writer_first_growth_bytes={writer_growth_fill} writer_reused_steady_bytes_per_iteration=0 writer_legacy_bytes_per_iteration={legacy_writer_fill_per_iteration} reader_first_growth_bytes={reader_growth_fill} reader_reused_steady_bytes_per_iteration=0 reader_legacy_growth_bytes_per_iteration={legacy_reader_fill_per_iteration} note=source-derived; reader legacy count sums positive resize growth over the warmed sequence; lifecycle timer compares writer policy and uses the current reader in both arms"
+        );
+    }
 }
 
 #[tokio::test]

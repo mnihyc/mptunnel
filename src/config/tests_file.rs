@@ -2326,35 +2326,12 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
         load_config_toml_str(&contents).expect("shipped configuration")
     };
 
-    let reference = load(include_str!("../../examples/config.reference.toml"));
-    assert_eq!(reference.session, SessionConfig::default());
-    assert_eq!(reference.resources, ResourceLimits::default());
-    let CommandConfig::Node(reference) = reference.command;
-    assert_eq!(reference.forwarding_mode, ForwardingMode::L4);
-    assert!(reference.servers.is_empty());
-    assert_eq!(reference.local_ingresses.len(), 2);
-    assert!(reference.tun_l3_ingresses.is_empty());
-    assert_eq!(mpp_outbounds(&reference)[0].paths.len(), 2);
-    assert_eq!(
-        mpp_outbounds(&reference)[0]
-            .performance
-            .optional_reinjection_budget_percent,
-        20
-    );
+    let reference_document = include_str!("../../examples/config.reference.toml");
     assert!(
-        mpp_outbounds(&reference)[0].paths[0]
-            .tls
-            .shared_transport_secret_configured()
-    );
-    assert_eq!(
-        reference
-            .product_policy
-            .as_ref()
-            .expect("reference Product policy")
-            .routes[0]
-            .action
-            .target_resolution(),
-        TargetResolutionMode::AsIs,
+        reference_document
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#')),
+        "the annotated reference must stay inert until copied into a role profile"
     );
 
     let client_document = include_str!("../../examples/client.toml");

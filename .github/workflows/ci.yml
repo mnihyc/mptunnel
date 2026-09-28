@@ -110,6 +110,12 @@ jobs:
           RUSTFLAGS: ${{ matrix.kind == 'windows' && '-C target-feature=+crt-static' || '' }}
         run: cargo test --locked --all-features --target ${{ matrix.target }}
 
+      - name: Run native Tokio service regression tests
+        if: matrix.kind == 'windows' || matrix.kind == 'unix'
+        env:
+          RUSTFLAGS: ${{ matrix.kind == 'windows' && '-C target-feature=+crt-static' || '' }}
+        run: cargo test --locked --manifest-path crates/tokio/Cargo.toml --features full,test-util --test rt_service_budget --target ${{ matrix.target }}
+
       - name: Verify Unix binary version
         if: matrix.kind != 'android' && matrix.kind != 'windows'
         shell: bash

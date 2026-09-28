@@ -49,6 +49,12 @@ jobs:
       - name: Standalone patched Quinn locked tests
         run: cargo test --locked --manifest-path crates/quinn-proto/Cargo.toml
 
+      - name: Standalone patched Tokio scheduler tests
+        run: >-
+          cargo test --locked --manifest-path crates/tokio/Cargo.toml
+          --features full,test-util --test rt_service_budget --test rt_threaded
+          --test rt_basic --test time_sleep
+
       - name: Validate performance impact registry
         run: python3 lab/validate_performance_declaration.py --check-registry
 

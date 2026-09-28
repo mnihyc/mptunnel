@@ -1422,9 +1422,9 @@ MAY select another carrier, but every retry MUST reuse the same `StreamId`.
 Initial acquisition uses the caller's original absolute logical-open deadline
 `T` and the same frozen candidate order. At a candidate's actual entry, freeze
 its whole cold-setup allowance `A_i` and one path-open PTO `P_i` from the same
-existing timing basis, observed-RTT treatment and bootstrap floor. Its initial
-unretained deadline is the immutable `S_i = min(start_i + A_i, T)`; its
-alternative-decision deadline initially is `D_i = S_i`. Endpoint setup, native
+existing timing basis, observed-RTT treatment and bootstrap floor. Its setup
+and initially unretained deadline is the immutable `S_i = min(start_i + A_i, T)`;
+its alternative-decision deadline initially is `D_i = S_i`. Endpoint setup, native
 pair allocation, partial OPEN/MAX writes, and the initial TCP flush retain `S_i`.
 
 For an exact backend with an unattempted alternative, complete local OPEN/MAX
@@ -1444,10 +1444,12 @@ absolute `D_i`; neither clock slides or restarts. Setup and partial writes use
 `S_i`, masking `D_i` until that current generation fully submits. This setup
 bound also applies when an earlier generation had gained retention: old
 submission cannot extend a new partial operation to `T`. After full submission
-before `S_i`, the current generation may again use its ordinal's actual-successor
-retention authority. Singleton and final attempts do not contract their lifetime
-because no alternative can create additional service. Only after full submission
-may an attempt awaiting its first MAX become eligible for retention.
+before `S_i`, the current generation may again use its ordinal's retention
+authority. For a singleton or final candidate with no unattempted alternative,
+full submission MUST retain that exact backend until `T`. An RTT-derived setup
+allowance is not evidence that submitted native work has failed; cancelling it
+when no successor can offer service would abandon a recoverable logical open.
+Only after full submission may an attempt awaiting its first MAX be retained.
 Submission is not evidence of transmission, peer receipt or target establishment.
 
 At an eligible attempt's `D_i` the logical acquisition coordinator
@@ -1455,18 +1457,23 @@ owns the next-candidate decision. The submitted attempt remains pending while
 that decision is due; its backend MUST NOT independently retire it before the
 coordinator can arbitrate actual first MAX against actual successor entry.
 This scheduling interval remains bounded by `T`, logical cancellation, and
-terminal authority. It is not itself permission for an unpromoted late success.
-Only when the next frozen candidate actually enters its open operation may that
-exact submitted predecessor continue under `T`. Merely reserving a candidate or
+terminal authority. Being Due alone does not authorize new setup or a new
+backend generation.
+When the next frozen candidate actually enters its open operation, the exact
+submitted predecessor may continue under `T`. Merely reserving a candidate or
 preparing an unpolled future does not extend the predecessor. A prepared launch
 MUST revalidate current full submission; renewed setup fences that preparation
 without consuming its ordinal or retaining its load lease. If finite reservation
 traversal finds no available successor, or all prepared successors fail before
-actual entry, the coordinator consumes the early decision and waits on `S_i`.
-It MUST NOT cancel the original at `D_i` or repeatedly select that consumed
-decision. Singleton and final candidates, incomplete submission, and unavailable
-successors retain `S_i`. A promoted attempt cannot start fresh setup or native
-retries after `S_i`.
+actual entry, the coordinator MUST consume the early decision and retain the
+exact fully submitted backend under the original `T`. It MUST NOT cancel that
+work at `D_i` or `S_i`, repeatedly select the consumed decision, reopen a settled
+or expired attempt, or create another logical stream. Incomplete submission
+retains `S_i`, even after alternatives are exhausted. Retention authorizes waiting
+for the existing native operation; it does not authorize fresh setup or native
+retries after `S_i`. Concrete transport failure, attachment refusal, authenticated
+logical/session termination, caller cancellation, and `T` still end the
+corresponding operation through the existing cleanup paths.
 
 Actual first MAX, including zero, and successor entry are serialized under one
 stream-scoped acquisition owner. A nominal decision observes the operation-wide
@@ -1475,15 +1482,18 @@ MAX between that observation and actual successor entry fences that prepared
 launch, even if a retained publisher has already settled. A live admitted owner
 also suppresses new timer-driven acquisition. Positive credit still decides
 logical success.
-A first MAX between `D_i` and `S_i` retains its ordinary authority even without
-an actual successor. It suppresses the prepared launch and may settle under
-`S_i`; the early decision is not an expiry of the original attempt.
-A first MAX observed after `S_i` without prior promotion is recorded and fences
-the prepared nominal launch, but that expired attempt cannot become a success
-under `T`. Once that exact admitted attempt settles with a concrete retryable
-failure, the coordinator MAY retry the next frozen candidate under its ordinary
-budget. Settlement cannot revive a previously fenced nominal launch and MUST
-NOT clear an authenticated logical or session terminal reason.
+An authenticated first MAX from the exact still-live, fully submitted backend
+MUST retain that backend under `T`, including when it arrives after `S_i` before
+the coordinator resolves a Due decision. Actual peer admission supersedes the
+setup estimate; it MUST NOT be rejected merely because no successor has yet
+started or exhaustion has not yet been observed. The admission transition and
+its sequence fence are atomic. Expired or settled attempts, stale generations,
+and replies at or after `T` MUST NOT regain authority. A zero MAX still grants
+no target success or data credit. Once that exact admitted attempt settles with
+a concrete retryable failure, the coordinator MAY retry the next frozen
+candidate under its ordinary budget. Settlement cannot revive a previously
+fenced nominal launch and MUST NOT clear an authenticated logical or session
+terminal reason.
 
 The first accepted candidate with positive target credit wins only while its
 frozen physical instance and logical/session authority remain current. Every
@@ -1500,10 +1510,14 @@ of overlapping native pairs,
 carrier entries, load leases, and duplicate CREATE/control traffic. Contracting
 the decision after submission may incur these costs earlier and more often;
 the original fully submitted attempt remains able to win under `S_i`, or under
-`T` only through actual successor retention. The Due interval adds coordinator
-scheduling dependency at `D_i`; retained work can
-persist until `T`. Practical latency and resource benefit require whole-runtime
-measurement and do not follow from earlier copy or open admission alone.
+`T` once a successor enters, no successor remains, or actual first MAX admits
+the exact backend. The Due interval adds coordinator scheduling dependency at
+`D_i`. A singleton, final, or exhausted-plan
+backend can keep its existing pair and load lease until `T`, rather than
+fail early while its reliable transport is still recovering. This adds bounded
+waiting and resource residence, not an additional publication or target connect.
+Practical latency and resource benefit require whole-runtime measurement and
+do not follow from earlier copy or open admission alone.
 
 The receiver owns exactly one target-establishment operation for one
 `(SessionId, StreamId)`. The original target, initial demand, authenticated

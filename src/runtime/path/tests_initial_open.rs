@@ -70,71 +70,81 @@ async fn due_backend_waits_for_actual_successor_entry() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn late_max_fences_nominal_start_but_settlement_allows_real_retry() {
-    let owner = InitialOpenAcquisition::new(
-        SessionId(702),
-        StreamId(802),
-        Instant::now() + Duration::from_secs(30),
-        2,
-    );
-    let first = submitted(&owner, 0, true);
-    tokio::time::advance(Duration::from_secs(11)).await;
-    first.deadline().unwrap(); // actor's nominal-expiry path publishes Due
-    let prepared = owner.launch_handle();
-    assert!(matches!(
-        first.admission(),
-        Err(RuntimeError::PathOpenTimedOut)
-    ));
-    assert!(owner.has_admission(), "actual late MAX is still observed");
-    assert!(
-        prepared
-            .begin(
-                1,
-                key(1),
-                Duration::from_secs(10),
-                Duration::from_secs(10),
-                false,
-                Some(0),
-            )
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(
-        owner.started_ordinals(),
-        [0],
-        "prepared ordinal remains unstarted"
-    );
-    owner.settle(0);
-    assert!(!owner.has_admission());
-    assert!(
-        prepared
-            .begin(
-                1,
-                key(1),
-                Duration::from_secs(10),
-                Duration::from_secs(10),
-                false,
-                Some(0),
-            )
-            .unwrap()
-            .is_none(),
-        "settling A cannot revive a previously fenced nominal launch",
-    );
-    assert!(
-        owner
-            .launch_handle()
-            .begin(
-                1,
-                key(1),
-                Duration::from_secs(10),
-                Duration::from_secs(10),
-                false,
-                None,
-            )
-            .unwrap()
-            .is_some(),
-        "settled late MAX cannot veto concrete-error retry"
-    );
+async fn late_max_is_admitted_and_fences_until_concrete_failure() {
+    for publish_due_before_max in [false, true] {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let owner = InitialOpenAcquisition::new(SessionId(702), StreamId(802), deadline, 2);
+        let first = submitted(&owner, 0, true);
+        tokio::time::advance(Duration::from_secs(11)).await;
+        if publish_due_before_max {
+            assert_eq!(
+                first.deadline().unwrap(),
+                deadline,
+                "coordinator may already have observed DecisionDue"
+            );
+        }
+        let prepared = owner.launch_handle();
+        assert_eq!(
+            first.admission().unwrap(),
+            deadline,
+            "a first MAX after S but before T remains valid"
+        );
+        assert!(owner.has_admission());
+        assert!(
+            owner.0.state.lock().unwrap().slots[0]
+                .as_ref()
+                .unwrap()
+                .retained
+        );
+        assert_eq!(first.deadline().unwrap(), deadline);
+        assert!(
+            prepared
+                .begin(
+                    1,
+                    key(1),
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                    false,
+                    Some(0),
+                )
+                .unwrap()
+                .is_none(),
+            "the actual MAX fences this prepared successor"
+        );
+        assert_eq!(owner.started_ordinals(), [0]);
+
+        owner.settle(0); // concrete native failure for this exact admitted owner
+        assert!(!owner.has_admission());
+        assert!(
+            prepared
+                .begin(
+                    1,
+                    key(1),
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                    false,
+                    Some(0),
+                )
+                .unwrap()
+                .is_none(),
+            "settling A cannot revive a launch prepared before its admission"
+        );
+        assert!(
+            owner
+                .launch_handle()
+                .begin(
+                    1,
+                    key(1),
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                    false,
+                    None,
+                )
+                .unwrap()
+                .is_some(),
+            "a fresh decision can retry after the exact owner fails"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -179,7 +189,7 @@ async fn admitted_zero_then_refusal_does_not_permanently_veto_retry() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn singleton_setup_and_stale_backends_never_gain_retention() {
+async fn singleton_submission_survives_s_but_stale_setup_does_not() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let owner = InitialOpenAcquisition::new(SessionId(704), StreamId(804), deadline, 2);
     let first = submitted(&owner, 0, false);
@@ -202,9 +212,10 @@ async fn singleton_setup_and_stale_backends_never_gain_retention() {
         Err(RuntimeError::ReliablePathRetired)
     ));
     tokio::time::advance(Duration::from_secs(10)).await;
-    assert!(
-        first.deadline().unwrap() <= Instant::now(),
-        "singleton expires"
+    assert_eq!(
+        first.deadline().unwrap(),
+        deadline,
+        "fully submitted singleton survives its setup allowance"
     );
     assert!(
         current.deadline().unwrap() <= Instant::now(),
@@ -226,10 +237,15 @@ async fn expired_backend_returns_one_stable_actor_stop() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let owner = InitialOpenAcquisition::new(SessionId(705), StreamId(805), deadline, 1);
     let backend = submitted(&owner, 0, false);
-    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::advance(Duration::from_secs(30)).await;
     let actor_now = Instant::now();
     let first = backend.deadline().unwrap();
     assert_eq!(first, actor_now);
+    assert!(
+        owner.exhaust_successors(0),
+        "expiry at T must not be revived"
+    );
+    assert_eq!(backend.deadline().unwrap(), first);
     tokio::time::advance(Duration::from_secs(1)).await;
     let later = backend.deadline().unwrap();
     assert_eq!(
@@ -241,6 +257,10 @@ async fn expired_backend_returns_one_stable_actor_stop() {
         "the actor's captured expiry-before-routing comparison remains true"
     );
     owner.settle(0);
+    assert!(
+        !owner.exhaust_successors(0),
+        "settled state cannot be revived"
+    );
     assert_eq!(
         backend.deadline().unwrap(),
         first,
@@ -377,7 +397,7 @@ async fn unsubmitted_backend_still_expires_only_at_whole_setup_bound() {
     );
     let attempt = owner
         .launch_handle()
-        .begin(0, key(0), setup, pto, true, None)
+        .begin(0, key(0), setup, pto, false, None)
         .unwrap()
         .unwrap();
     let backend = attempt.begin_backend().unwrap();
@@ -490,27 +510,33 @@ async fn late_full_submission_and_logical_clipping_never_extend_existing_bound()
         assert_eq!(owner.decision_deadline(0), Some(original));
         assert_eq!(attempt.timing().unwrap().0, original);
         tokio::time::advance(pto / 2).await;
-        assert!(owner.exhaust_successors(0));
-        assert_eq!(backend.deadline().unwrap(), original);
-        assert!(matches!(
-            backend.admission(),
-            Err(RuntimeError::PathOpenTimedOut)
-        ));
+        let logical_deadline_was_clipped = logical <= original;
+        assert_eq!(
+            owner.exhaust_successors(0),
+            logical_deadline_was_clipped,
+            "a submitted candidate keeps T unless T itself already expired"
+        );
+        if logical_deadline_was_clipped {
+            assert_eq!(backend.deadline().unwrap(), original);
+            assert!(matches!(
+                backend.admission(),
+                Err(RuntimeError::PathOpenTimedOut)
+            ));
+        } else {
+            assert_eq!(backend.deadline().unwrap(), logical);
+            assert_eq!(backend.admission().unwrap(), logical);
+        }
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn singleton_and_final_submission_keep_original_terminal_lifetime() {
+async fn singleton_and_final_submission_retain_to_logical_deadline() {
     let (_, pto) = phase_budgets();
     let terminal_budget = pto.saturating_mul(crate::model::timing::path_open_pto_multiplier(None));
     for (total, ordinal) in [(1, 0), (2, 1)] {
         let start = Instant::now();
-        let owner = InitialOpenAcquisition::new(
-            SessionId(714),
-            StreamId(814),
-            start + Duration::from_secs(30),
-            total,
-        );
+        let logical = start + Duration::from_secs(30);
+        let owner = InitialOpenAcquisition::new(SessionId(714), StreamId(814), logical, total);
         let attempt = owner
             .launch_handle()
             .begin(
@@ -526,18 +552,13 @@ async fn singleton_and_final_submission_keep_original_terminal_lifetime() {
         let backend = attempt.begin_backend().unwrap();
         backend.bind(next_carrier_path_instance_id()).unwrap();
         backend.submitted().unwrap();
+        assert_eq!(backend.deadline().unwrap(), logical);
+        assert_eq!(owner.decision_deadline(ordinal), None);
         tokio::time::advance(pto).await;
-        assert_eq!(backend.deadline().unwrap(), start + terminal_budget);
-        assert_eq!(
-            owner.decision_deadline(ordinal),
-            Some(start + terminal_budget)
-        );
+        assert_eq!(backend.deadline().unwrap(), logical);
         tokio::time::advance(terminal_budget - pto).await;
-        assert_eq!(backend.deadline().unwrap(), Instant::now());
-        assert!(matches!(
-            backend.admission(),
-            Err(RuntimeError::PathOpenTimedOut)
-        ));
+        assert_eq!(backend.deadline().unwrap(), logical);
+        assert_eq!(backend.admission().unwrap(), logical);
     }
 }
 
@@ -570,7 +591,7 @@ async fn early_due_preserves_first_max_authority_before_actual_successor_retenti
         );
         if max_first {
             // Admission represents actual first MAX even when its value is zero.
-            assert_eq!(backend.admission().unwrap(), attempt.timing().unwrap().0);
+            assert_eq!(backend.admission().unwrap(), deadline);
             assert!(owner.has_admission());
             assert!(
                 prepared
@@ -611,16 +632,12 @@ async fn early_due_preserves_first_max_authority_before_actual_successor_retenti
 }
 
 #[tokio::test(start_paused = true)]
-async fn exhausted_early_decision_preserves_original_lifetime_and_first_max() {
+async fn exhausted_early_decision_retains_full_submission_until_logical_deadline() {
     let (setup, pto) = phase_budgets();
     for receive_max in [false, true] {
         let start = Instant::now();
-        let owner = InitialOpenAcquisition::new(
-            SessionId(717),
-            StreamId(817),
-            start + Duration::from_secs(30),
-            2,
-        );
+        let logical = start + Duration::from_secs(30);
+        let owner = InitialOpenAcquisition::new(SessionId(717), StreamId(817), logical, 2);
         let attempt = owner
             .launch_handle()
             .begin(0, key(0), setup, pto, true, None)
@@ -638,28 +655,33 @@ async fn exhausted_early_decision_preserves_original_lifetime_and_first_max() {
             !owner.exhaust_successors(0),
             "no successor cannot cancel at D"
         );
-        assert_eq!(backend.deadline().unwrap(), start + setup);
+        assert_eq!(backend.deadline().unwrap(), logical);
         assert_eq!(
             owner.decision_deadline(0),
-            Some(start + setup),
+            None,
             "consumed D cannot busy-loop"
         );
         assert!(
-            !owner.0.state.lock().unwrap().slots[0]
+            owner.0.state.lock().unwrap().slots[0]
                 .as_ref()
                 .unwrap()
                 .retained
         );
-        tokio::time::advance(pto / 2).await;
+        tokio::time::advance(start + setup + Duration::from_millis(1) - Instant::now()).await;
+        assert_eq!(backend.deadline().unwrap(), logical);
         if receive_max {
-            assert_eq!(backend.admission().unwrap(), start + setup);
+            assert_eq!(backend.admission().unwrap(), logical);
             assert!(owner.has_admission());
             assert_eq!(owner.decision_deadline(0), None);
         } else {
-            tokio::time::advance(start + setup - Instant::now()).await;
-            assert_eq!(backend.deadline().unwrap(), start + setup);
+            let pending = std::future::pending::<Result<(), RuntimeError>>();
+            tokio::pin!(pending);
+            let operation = backend.complete(pending.as_mut());
+            tokio::pin!(operation);
+            assert!(operation.as_mut().now_or_never().is_none());
+            tokio::time::advance(logical - Instant::now()).await;
             assert!(matches!(
-                backend.admission(),
+                operation.await,
                 Err(RuntimeError::PathOpenTimedOut)
             ));
         }
@@ -782,6 +804,114 @@ async fn early_retained_retry_keeps_partial_setup_on_original_bound() {
             ));
             assert!(matches!(
                 attempt.begin_backend(),
+                Err(RuntimeError::PathOpenTimedOut)
+            ));
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn fully_submitted_final_candidate_keeps_logical_deadline() {
+    let (setup, pto) = phase_budgets();
+    let terminal_budget = setup.max(pto);
+    for (total, ordinal) in [(1, 0), (2, 1)] {
+        for receive_max_after_setup in [false, true] {
+            let start = Instant::now();
+            let logical = start + Duration::from_secs(30);
+            let owner = InitialOpenAcquisition::new(SessionId(720), StreamId(820), logical, total);
+            let attempt = owner
+                .launch_handle()
+                .begin(
+                    ordinal,
+                    key(usize::from(ordinal)),
+                    terminal_budget,
+                    pto,
+                    false,
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            let backend = attempt.begin_backend().unwrap();
+            backend.bind(next_carrier_path_instance_id()).unwrap();
+            backend.submitted().unwrap();
+
+            assert_eq!(backend.deadline().unwrap(), logical);
+            assert_eq!(owner.decision_deadline(ordinal), None);
+            tokio::time::advance(terminal_budget + Duration::from_millis(1)).await;
+            assert_eq!(
+                backend.deadline().unwrap(),
+                logical,
+                "full submission has no fallback, so setup S no longer cancels it"
+            );
+
+            if receive_max_after_setup {
+                assert_eq!(backend.admission().unwrap(), logical);
+                assert!(owner.has_admission());
+            } else {
+                let pending = std::future::pending::<Result<(), RuntimeError>>();
+                tokio::pin!(pending);
+                let operation = backend.complete(pending.as_mut());
+                tokio::pin!(operation);
+                assert!(operation.as_mut().now_or_never().is_none());
+                tokio::time::advance(logical - Instant::now()).await;
+                assert!(matches!(
+                    operation.await,
+                    Err(RuntimeError::PathOpenTimedOut)
+                ));
+                assert!(matches!(
+                    backend.admission(),
+                    Err(RuntimeError::PathOpenTimedOut)
+                ));
+                assert!(!owner.has_admission(), "MAX at T cannot revive the open");
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_successor_search_retains_submitted_candidate_until_logical_deadline() {
+    let (setup, pto) = phase_budgets();
+    for receive_max_after_setup in [false, true] {
+        let start = Instant::now();
+        let logical = start + Duration::from_secs(30);
+        let owner = InitialOpenAcquisition::new(SessionId(721), StreamId(821), logical, 2);
+        let attempt = owner
+            .launch_handle()
+            .begin(0, key(0), setup, pto, true, None)
+            .unwrap()
+            .unwrap();
+        let backend = attempt.begin_backend().unwrap();
+        backend.bind(next_carrier_path_instance_id()).unwrap();
+        backend.submitted().unwrap();
+
+        tokio::time::advance(pto).await;
+        assert_eq!(backend.deadline().unwrap(), logical, "D is not terminal");
+        tokio::time::advance(start + setup + Duration::from_millis(1) - Instant::now()).await;
+        assert!(
+            !owner.exhaust_successors(0),
+            "exhausting candidates must not cancel a submitted attempt"
+        );
+        assert_eq!(backend.deadline().unwrap(), logical);
+        assert_eq!(owner.decision_deadline(0), None, "consumed D cannot spin");
+        assert!(
+            owner.0.state.lock().unwrap().slots[0]
+                .as_ref()
+                .unwrap()
+                .retained
+        );
+
+        if receive_max_after_setup {
+            assert_eq!(backend.admission().unwrap(), logical);
+            assert!(owner.has_admission());
+        } else {
+            let pending = std::future::pending::<Result<(), RuntimeError>>();
+            tokio::pin!(pending);
+            let operation = backend.complete(pending.as_mut());
+            tokio::pin!(operation);
+            assert!(operation.as_mut().now_or_never().is_none());
+            tokio::time::advance(logical - Instant::now()).await;
+            assert!(matches!(
+                operation.await,
                 Err(RuntimeError::PathOpenTimedOut)
             ));
         }

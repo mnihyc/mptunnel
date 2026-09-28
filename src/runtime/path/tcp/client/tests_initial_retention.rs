@@ -1,7 +1,7 @@
 //! Real authenticated TCP producers exercise the finite initial coordinator.
 use super::*;
 use crate::model::path::RelayPathKey;
-use crate::protocol::StreamReturnPlan;
+use crate::protocol::{ResetReason, StreamReturnPlan};
 use crate::runtime::relay::open::{open_remote_stream_until, reliable_initial_open_timeout};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
@@ -15,9 +15,13 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with_path_count(2).await
+    }
+
+    async fn new_with_path_count(path_count: usize) -> Self {
         let mut listeners = Vec::new();
         let mut paths = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..path_count {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             paths.push(
@@ -93,7 +97,17 @@ async fn grant(peer: &mut Peer, stream_id: StreamId, max_offset: u64) {
 async fn routed(peer: &mut Peer, nonce: u64) {
     peer.write_frame(&Frame::Ping { nonce }).await.unwrap();
     peer.flush().await.unwrap();
-    assert_eq!(peer.read_frame().await.unwrap(), Frame::Pong { nonce });
+    loop {
+        match peer.read_frame().await.unwrap() {
+            Frame::Pong { nonce: received } if received == nonce => return,
+            Frame::Ping { nonce } => {
+                peer.write_frame(&Frame::Pong { nonce }).await.unwrap();
+                peer.flush().await.unwrap();
+            }
+            Frame::PathMetrics { .. } | Frame::PathProofData { .. } | Frame::Pong { .. } => {}
+            frame => panic!("unexpected frame while waiting for routed Pong: {frame:?}"),
+        }
+    }
 }
 
 async fn detached(peer: &mut Peer, stream_id: StreamId) {
@@ -337,6 +351,130 @@ async fn logical_deadline_with_terminal(reset: bool) {
         );
     }
     drop(submitted);
+    settle_actors(&context).await;
+}
+
+#[tokio::test]
+async fn tcp_initial_singleton_accepts_first_max_after_setup_allowance() {
+    let Fixture { context, peers } = Fixture::new_with_path_count(1).await;
+    let peer = peers.into_iter().next().expect("single candidate peer");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let opening = open_remote_stream_until(
+        &context,
+        TargetAddr::Ip(([127, 0, 0, 1], 80).into()),
+        TrafficClass::Latency,
+        deadline,
+    );
+    tokio::pin!(opening);
+    let (mut peer, index, stream_id, plan) = tokio::time::timeout(PEER_GUARD, async {
+        tokio::select! {
+            request = submitted_peer(peer, 0) => request,
+            _ = &mut opening => panic!("single-candidate open completed before peer MAX"),
+        }
+    })
+    .await
+    .expect("single candidate submits its native CREATE/MAX");
+    assert_eq!(plan.candidate_total, 1);
+    assert_eq!(plan.candidate_ordinal, 0);
+
+    let setup = reliable_initial_open_timeout(
+        &context,
+        RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index,
+        },
+        false,
+    );
+    tokio::time::pause();
+    tokio::time::advance(setup + Duration::from_millis(1)).await;
+    assert!(
+        opening.as_mut().now_or_never().is_none(),
+        "a fully submitted final candidate remains live beyond its setup allowance"
+    );
+    tokio::time::resume();
+
+    grant(
+        &mut peer,
+        stream_id,
+        context.mux_limits.max_stream_window_bytes,
+    )
+    .await;
+    let opened = tokio::time::timeout(PEER_GUARD, &mut opening)
+        .await
+        .expect("late first MAX settles before the original logical deadline")
+        .expect("late first MAX admits the still-live final candidate");
+    assert_eq!(opened.path_index(), index);
+    assert_eq!(opened.stream().stream_id, stream_id);
+    assert_eq!(context.reliable_selection_passes_for_test(), 1);
+    opened.retire_uncommitted();
+    tokio::time::timeout(PEER_GUARD, detached(&mut peer, stream_id))
+        .await
+        .expect("the one accepted CREATE retires in order");
+    settle_actors(&context).await;
+}
+
+#[tokio::test]
+async fn tcp_initial_singleton_reset_after_setup_allowance_is_not_swallowed() {
+    let Fixture { context, peers } = Fixture::new_with_path_count(1).await;
+    let peer = peers.into_iter().next().expect("single candidate peer");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let opening = open_remote_stream_until(
+        &context,
+        TargetAddr::Ip(([127, 0, 0, 1], 80).into()),
+        TrafficClass::Latency,
+        deadline,
+    );
+    tokio::pin!(opening);
+    let (mut peer, index, stream_id, plan) = tokio::time::timeout(PEER_GUARD, async {
+        tokio::select! {
+            request = submitted_peer(peer, 0) => request,
+            _ = &mut opening => panic!("single-candidate open completed before peer terminal"),
+        }
+    })
+    .await
+    .expect("single candidate submits its native CREATE/MAX");
+    assert_eq!(plan.candidate_total, 1);
+    let setup = reliable_initial_open_timeout(
+        &context,
+        RelayPathKey {
+            underlay: UnderlayProtocol::Tcp,
+            index,
+        },
+        false,
+    );
+    tokio::time::pause();
+    tokio::time::advance(setup + Duration::from_millis(1)).await;
+    assert!(
+        opening.as_mut().now_or_never().is_none(),
+        "the submitted request remains pending before its logical deadline"
+    );
+    tokio::time::resume();
+
+    peer.write_frame(&Frame::StreamReset {
+        stream_id,
+        reason: ResetReason::Refused,
+    })
+    .await
+    .unwrap();
+    peer.flush().await.unwrap();
+    let result = tokio::time::timeout(PEER_GUARD, &mut opening)
+        .await
+        .expect("authenticated RESET is handled before T");
+    let error = match result {
+        Ok(opened) => {
+            opened.retire_uncommitted();
+            panic!("a refused target must not be reported as success");
+        }
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, RuntimeError::RemoteReset(ResetReason::Refused)),
+        "the exact target refusal survives retention: {error:?}"
+    );
+    assert_eq!(context.reliable_selection_passes_for_test(), 1);
+    tokio::time::timeout(PEER_GUARD, routed(&mut peer, 1512))
+        .await
+        .expect("carrier remains routable after the terminal stream reset");
     settle_actors(&context).await;
 }
 

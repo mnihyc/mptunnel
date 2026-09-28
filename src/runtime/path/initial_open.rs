@@ -41,6 +41,9 @@ struct Slot {
     carrier: Option<CarrierPathInstanceId>,
     phase: Phase,
     terminal_deadline: Option<Instant>,
+    // Full submissions can outlive S through T after a successor starts, no
+    // successor can be attempted, or the peer sends the first MAX. Setup stays
+    // bounded by S.
     retained: bool,
 }
 
@@ -80,6 +83,13 @@ impl Slot {
             nominal: self.nominal,
             observed_at,
         }
+    }
+
+    fn retain_until_logical_deadline(&mut self) {
+        if self.phase == Phase::DecisionDue {
+            self.phase = Phase::Submitted;
+        }
+        self.retained = true;
     }
 }
 
@@ -286,9 +296,10 @@ impl InitialOpenAcquisition {
         expired
     }
 
-    /// Finite reservation traversal found no actual successor. Consume that
-    /// opportunity without shortening the original's unretained lifetime S.
-    /// Return true only when S already expired and cancellation is warranted.
+    /// Finite reservation traversal found no actual successor. A fully
+    /// submitted attempt then owns the existing logical deadline T; unsubmitted
+    /// setup remains bounded by its original S. Return true only when the
+    /// applicable terminal bound already expired.
     pub(in crate::runtime) fn exhaust_successors(&self, ordinal: u8) -> bool {
         let mut state = self.0.state.lock().expect("initial open lock");
         let mut observation = None;
@@ -298,9 +309,10 @@ impl InitialOpenAcquisition {
             .and_then(Option::as_mut)
             && !matches!(slot.phase, Phase::Settled | Phase::Admitted)
         {
+            let fully_submitted = matches!(slot.phase, Phase::Submitted | Phase::DecisionDue);
             slot.may_start_successor = false;
-            if slot.phase == Phase::DecisionDue {
-                slot.phase = Phase::Submitted;
+            if fully_submitted {
+                slot.retain_until_logical_deadline();
             }
             observation = Some(slot.observation(ordinal, "alternatives_exhausted"));
             self.0
@@ -476,8 +488,7 @@ impl InitialOpenLaunch {
         {
             inner.update_deadline(previous, slot, now, &mut previous_observation);
             if slot.phase == Phase::DecisionDue {
-                slot.retained = true;
-                slot.phase = Phase::Submitted;
+                slot.retain_until_logical_deadline();
                 previous_observation = Some(slot.observation(previous, "retained"));
             } else if matches!(slot.phase, Phase::Setup | Phase::Submitted) {
                 // A new backend can re-enter Setup before S while a nominal
@@ -717,13 +728,16 @@ impl InitialOpenBackend {
             }
             // Transport/path setup and both local OPEN/MAX writes are complete.
             // Price only the remaining admission exchange when another frozen
-            // candidate can compete. D contracts, while the original setup and
-            // unretained lifetime S remains fixed. A later backend cannot
-            // restart the stored decision, and Setup masks it until submission.
+            // candidate can compete. D contracts, while setup S remains fixed.
+            // If no successor exists, this complete native submission is
+            // retained to T. A later backend cannot restart D, and Setup masks
+            // retention until another full submission completes.
             if slot.may_start_successor {
                 slot.decision = now
                     .checked_add(slot.admission_budget)
                     .map_or(slot.decision, |deadline| slot.decision.min(deadline));
+            } else {
+                slot.retained = true;
             }
             slot.phase = Phase::Submitted;
             *observation = Some(slot.observation(self.attempt.ordinal, "submitted"));
@@ -748,17 +762,12 @@ impl InitialOpenBackend {
                     "initial admission observation exhausted",
                 ))?;
             slot.phase = Phase::Admitted;
+            // An actual first MAX proves that the remote peer accepted this
+            // fully submitted open. Give its target-credit wait the existing
+            // logical T even if coordinator work crossed its nominal S.
+            slot.retained = true;
             *observation = Some(slot.observation(self.attempt.ordinal, "first_max"));
-            // During DecisionDue native input remains real, but coordinator
-            // delay alone cannot grant an unpromoted attempt extra success time.
-            if !slot.retained && now > slot.nominal {
-                return Err(RuntimeError::PathOpenTimedOut);
-            }
-            Ok(if slot.retained {
-                inner.deadline
-            } else {
-                slot.nominal
-            })
+            Ok(inner.deadline)
         })
     }
 

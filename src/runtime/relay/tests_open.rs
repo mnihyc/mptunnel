@@ -699,7 +699,7 @@ fn initial_open_retry_reuses_one_logical_stream_id() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn stale_prepared_initial_successor_preserves_due_predecessor_decision() {
+async fn stale_prepared_initial_successor_retains_predecessor_until_logical_deadline() {
     for early_decision in [false, true] {
         let context = ClientPathContext::new(
             vec![
@@ -722,10 +722,11 @@ async fn stale_prepared_initial_successor_preserves_due_predecessor_decision() {
         };
         context.install_relay_path_instance_for_test(frozen_instance);
         let stream_id = context.allocate_reliable_stream_id().unwrap();
+        let logical = tokio::time::Instant::now() + Duration::from_secs(30);
         let acquisition = crate::runtime::path::InitialOpenAcquisition::new(
             context.session_id,
             stream_id,
-            tokio::time::Instant::now() + Duration::from_secs(30),
+            logical,
             2,
         );
         let original = acquisition
@@ -809,17 +810,17 @@ async fn stale_prepared_initial_successor_preserves_due_predecessor_decision() {
             .is_none(),
             "the sole remaining frozen instance cannot be reserved"
         );
-        // A stale reservation neither grants T nor cancels before original S.
-        assert_eq!(
-            acquisition.exhaust_successors(predecessor.unwrap()),
-            !early_decision
-        );
+        // A stale reservation cannot start a successor. Once traversal is
+        // exhausted, the submitted predecessor keeps the caller's existing T.
+        assert!(!acquisition.exhaust_successors(predecessor.unwrap()));
+        assert_eq!(backend.deadline().unwrap(), logical);
+        assert_eq!(acquisition.decision_deadline(0), None);
         if early_decision {
             let original_deadline = original.timing().unwrap().0;
-            assert_eq!(backend.deadline().unwrap(), original_deadline);
-            assert_eq!(acquisition.decision_deadline(0), Some(original_deadline));
             tokio::time::advance(original_deadline - tokio::time::Instant::now()).await;
         }
+        assert_eq!(backend.deadline().unwrap(), logical);
+        tokio::time::advance(logical - tokio::time::Instant::now()).await;
         assert!(backend.deadline().unwrap() <= tokio::time::Instant::now());
     }
 }

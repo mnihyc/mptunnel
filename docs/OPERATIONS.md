@@ -1130,7 +1130,9 @@ Product and relay limits remain in force.
 
 A smaller value lowers the maximum unassigned source backlog but can split reads
 into smaller pieces, require more refills, and increase service CPU. Larger
-values can permit more source batching. Compare useful throughput, CPU per
+values can permit more source batching. Lower memory and interactive latency
+can come with lower bulk throughput and substantially higher CPU cost, including
+with multiple runtime workers. Compare useful throughput, CPU per
 delivered byte, memory, and loaded latency for the workload. One MiB is an
 example ceiling equal to two default 512 KiB relay chunk allowances, not a
 recommended default or RTT/BDP target. Zero is invalid. The option does not

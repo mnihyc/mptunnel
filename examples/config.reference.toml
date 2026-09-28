@@ -226,10 +226,10 @@
 #| max_reliable_relay_chunk_bytes = 524288
 # Optional per-stream ceiling for unassigned Throughput responses read from
 # MPP inbound targets. Smaller caps bound staging but may require more refills
-# and service CPU; larger caps permit more batching. It does not cap data after
-# stream-offset assignment or total session memory/RSS. 1 MiB is two default
-# 512 KiB relay chunk allowances, an example rather than a default or RTT/BDP
-# target. Choose from workload measurements.
+# and service CPU or lower bulk throughput; larger caps permit more batching.
+# It does not cap data after stream-offset assignment or total session memory/RSS.
+# 1 MiB is two default 512 KiB relay chunk allowances, an example rather than
+# a default or RTT/BDP target. Choose from workload measurements.
 # max_response_prefetch_bytes = 1048576
 
 # TCP record heartbeats and native QUIC liveness are separate carrier

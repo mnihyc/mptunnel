@@ -121,16 +121,15 @@ impl EventPublisher {
         let id = shared.next_interval_source.fetch_add(1, Ordering::Relaxed);
         match shared.interval_sources.try_lock() {
             Ok(mut sources) => {
-                sources.insert(
-                    id,
-                    IntervalSource {
-                        subject: subject.into(),
-                        provider,
-                    },
-                );
+                let source = Arc::new(IntervalSource {
+                    subject: subject.into(),
+                    provider,
+                });
+                sources.insert(id, Arc::downgrade(&source));
                 IntervalSnapshotRegistration {
                     shared: Arc::downgrade(shared),
                     id: Some(id),
+                    source: Some(source),
                 }
             }
             Err(_) => {
@@ -248,6 +247,7 @@ impl WebhookTestCaptureHandle {
 pub(crate) struct IntervalSnapshotRegistration {
     shared: Weak<Shared>,
     id: Option<u64>,
+    source: Option<Arc<IntervalSource>>,
 }
 
 impl IntervalSnapshotRegistration {
@@ -255,24 +255,22 @@ impl IntervalSnapshotRegistration {
         Self {
             shared: Weak::new(),
             id: None,
+            source: None,
         }
     }
 }
 
 impl Drop for IntervalSnapshotRegistration {
     fn drop(&mut self) {
+        // The guard is the registration's strong owner. Release that ownership
+        // before attempting eager removal; a busy map is pruned by its next
+        // scheduled interval sweep.
+        drop(self.source.take());
         let (Some(shared), Some(id)) = (self.shared.upgrade(), self.id.take()) else {
             return;
         };
         if let Ok(mut sources) = shared.interval_sources.try_lock() {
             sources.remove(&id);
-        } else {
-            // Retirement must not wait behind a snapshot. A stale weak source
-            // is removed by the next interval sweep; its callback captures
-            // only a Weak owner and therefore becomes inert immediately.
-            if let Ok(mut pending) = shared.interval_remove_pending.try_lock() {
-                pending.push(id);
-            }
         }
     }
 }
@@ -587,8 +585,7 @@ struct Shared {
     closed: AtomicBool,
     activated: AtomicBool,
     state: Mutex<QueueState>,
-    interval_sources: Mutex<HashMap<u64, IntervalSource>>,
-    interval_remove_pending: Mutex<Vec<u64>>,
+    interval_sources: Mutex<HashMap<u64, Weak<IntervalSource>>>,
     next_interval_source: AtomicU64,
     stats: Arc<StatsAtomic>,
     prepared_tls: Vec<Option<Arc<rustls::ClientConfig>>>,
@@ -710,7 +707,6 @@ impl Shared {
             closed: AtomicBool::new(false),
             activated: AtomicBool::new(false),
             interval_sources: Mutex::new(HashMap::new()),
-            interval_remove_pending: Mutex::new(Vec::new()),
             next_interval_source: AtomicU64::new(1),
             stats,
             prepared_tls,
@@ -1050,7 +1046,6 @@ async fn run_worker(
     let mut stop_deadline = *shutdown.borrow();
 
     loop {
-        process_interval_removals(&shared);
         sweep_source_events(&shared);
         fanout_ready_sources(&shared);
         expire_waiting_retries(&shared, &mut active, &mut retry_wait, &mut cleanup);
@@ -1143,24 +1138,6 @@ fn next_retry_deadline(
         .min()
 }
 
-fn process_interval_removals(shared: &Shared) {
-    let Ok(mut pending) = shared.interval_remove_pending.try_lock() else {
-        return;
-    };
-    if pending.is_empty() {
-        return;
-    }
-    let ids = std::mem::take(&mut *pending);
-    drop(pending);
-    if let Ok(mut sources) = shared.interval_sources.try_lock() {
-        for id in ids {
-            sources.remove(&id);
-        }
-    } else if let Ok(mut pending) = shared.interval_remove_pending.try_lock() {
-        pending.extend(ids);
-    }
-}
-
 fn publish_due_intervals(
     shared: &Shared,
     next_intervals: &mut [(usize, tokio::time::Instant, Duration)],
@@ -1181,15 +1158,23 @@ fn publish_due_intervals(
         return;
     }
     let sources = match shared.interval_sources.try_lock() {
-        Ok(sources) => sources
-            .iter()
-            .map(|(id, source)| (*id, source.subject.clone(), source.provider.clone()))
-            .collect::<Vec<_>>(),
+        Ok(mut sources) => {
+            let mut live_sources = Vec::with_capacity(sources.len());
+            sources.retain(|_, source| {
+                if let Some(source) = source.upgrade() {
+                    live_sources.push(source);
+                    true
+                } else {
+                    false
+                }
+            });
+            live_sources
+        }
         Err(_) => return,
     };
     for (rule_index, interval) in due_rules {
-        for (_, subject, provider) in &sources {
-            let Some(snapshot) = provider() else {
+        for source in &sources {
+            let Some(snapshot) = (source.provider)() else {
                 continue;
             };
             let mut path = match snapshot {
@@ -1198,14 +1183,16 @@ fn publish_due_intervals(
             };
             path.insert("interval_s".to_owned(), json!(interval.as_secs_f64()));
             let data = json!({ "path": Value::Object(path) });
-            let Some(mut event) = make_event(shared, EventKind::PathInterval, subject, data) else {
+            let Some(mut event) =
+                make_event(shared, EventKind::PathInterval, &source.subject, data)
+            else {
                 shared
                     .stats
                     .oversized_events
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            event.coalesce_key = Some((rule_index, subject.clone()));
+            event.coalesce_key = Some((rule_index, source.subject.clone()));
             enqueue_source(shared, event, false, Some(rule_index));
         }
     }
@@ -1867,9 +1854,7 @@ mod tests {
         assert_eq!(sequences, (1..=20).collect::<Vec<_>>());
     }
 
-    #[test]
-    fn interval_snapshot_places_fractional_period_and_subject_sequence_in_path() {
-        let interval = Duration::from_millis(250);
+    fn interval_publisher(interval: Duration) -> (Arc<Shared>, EventPublisher) {
         let mut shared = configured_shared(DeliveryPolicy::default(), 4);
         let shared_mut = Arc::get_mut(&mut shared).expect("unique shared runtime");
         let config = Arc::make_mut(&mut shared_mut.config);
@@ -1881,18 +1866,30 @@ mod tests {
             }],
             ..EventMatcher::default()
         };
-        shared_mut.interval_sources.lock().unwrap().insert(
-            1,
-            IntervalSource {
-                subject: Arc::from("path/test"),
-                provider: Arc::new(|| {
-                    Some(json!({
-                        "name": "test",
-                        "state": "up",
-                        "subject_sequence": 17
-                    }))
-                }),
-            },
+        shared_mut.interested[0].store(
+            1u64 << (EventKind::PathInterval as usize),
+            Ordering::Relaxed,
+        );
+        let publisher = EventPublisher {
+            shared: Some(shared.clone()),
+            test_capture: None,
+        };
+        (shared, publisher)
+    }
+
+    #[test]
+    fn interval_snapshot_places_fractional_period_and_subject_sequence_in_path() {
+        let interval = Duration::from_millis(250);
+        let (shared, publisher) = interval_publisher(interval);
+        let _registration = publisher.register_interval_snapshot(
+            "path/test",
+            Arc::new(|| {
+                Some(json!({
+                    "name": "test",
+                    "state": "up",
+                    "subject_sequence": 17
+                }))
+            }),
         );
 
         let now = tokio::time::Instant::now();
@@ -1906,6 +1903,142 @@ mod tests {
         assert_eq!(delivery.envelope["path"]["subject_sequence"], 17);
         assert_eq!(delivery.envelope["event"]["subject_sequence"], 17);
         assert_eq!(delivery.envelope["subject"]["sequence"], 17);
+    }
+
+    #[test]
+    fn dropped_interval_source_is_pruned_after_cleanup_lock_contention() {
+        let interval = Duration::from_secs(1);
+        let (shared, publisher) = interval_publisher(interval);
+
+        let retired_owner = Arc::new(());
+        let retired_owner_weak = Arc::downgrade(&retired_owner);
+        let retired_calls = Arc::new(AtomicUsize::new(0));
+        let retired_calls_in_provider = retired_calls.clone();
+        let retired_registration = publisher.register_interval_snapshot(
+            "path/retired",
+            Arc::new(move || {
+                retired_calls_in_provider.fetch_add(1, Ordering::Relaxed);
+                let _owner = retired_owner_weak.upgrade()?;
+                None
+            }),
+        );
+        drop(retired_owner);
+
+        let live_calls = Arc::new(AtomicUsize::new(0));
+        let live_calls_in_provider = live_calls.clone();
+        let _live_registration = publisher.register_interval_snapshot(
+            "path/live",
+            Arc::new(move || {
+                live_calls_in_provider.fetch_add(1, Ordering::Relaxed);
+                None
+            }),
+        );
+        assert_eq!(shared.interval_sources.lock().unwrap().len(), 2);
+
+        // The registration drops while the map is busy. Its weak entry must
+        // be pruned by the next due sweep; no cleanup queue owns this ID.
+        let sources = shared.interval_sources.lock().unwrap();
+        drop(retired_registration);
+        drop(sources);
+
+        let now = tokio::time::Instant::now();
+        let mut due = [(0, now - Duration::from_millis(1), interval)];
+        publish_due_intervals(&shared, &mut due);
+        assert_eq!(
+            retired_calls.load(Ordering::Relaxed),
+            0,
+            "a retired provider must not be called by the next due sweep"
+        );
+        assert_eq!(
+            live_calls.load(Ordering::Relaxed),
+            1,
+            "a live provider returning no snapshot is still invoked"
+        );
+        assert_eq!(
+            shared.interval_sources.lock().unwrap().len(),
+            1,
+            "the dead registration is pruned while the live None provider remains"
+        );
+
+        due[0].1 = tokio::time::Instant::now() - Duration::from_millis(1);
+        publish_due_intervals(&shared, &mut due);
+        assert_eq!(live_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.interval_sources.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dropped_registration_revokes_a_retained_provider_clone() {
+        let interval = Duration::from_secs(1);
+        let (shared, publisher) = interval_publisher(interval);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in_provider = calls.clone();
+        let provider: Arc<dyn Fn() -> Option<Value> + Send + Sync> = Arc::new(move || {
+            calls_in_provider.fetch_add(1, Ordering::Relaxed);
+            None
+        });
+        let retained_provider = provider.clone();
+        let registration = publisher.register_interval_snapshot("path/retained", provider);
+        assert_eq!(shared.interval_sources.lock().unwrap().len(), 1);
+
+        let sources = shared.interval_sources.lock().unwrap();
+        drop(registration);
+        drop(sources);
+        let now = tokio::time::Instant::now();
+        let mut due = [(0, now - Duration::from_millis(1), interval)];
+        publish_due_intervals(&shared, &mut due);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            shared.interval_sources.lock().unwrap().len(),
+            0,
+            "an external callback clone must not retain registration authority"
+        );
+        assert_eq!(Arc::strong_count(&retained_provider), 1);
+        drop(retained_provider);
+    }
+
+    #[test]
+    fn in_flight_interval_callback_finishes_after_registration_drop() {
+        let interval = Duration::from_secs(1);
+        let (shared, publisher) = interval_publisher(interval);
+        let shared_weak = Arc::downgrade(&shared);
+        let registration_slot = Arc::new(Mutex::new(None));
+        let registration_slot_weak = Arc::downgrade(&registration_slot);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let entered_in_provider = entered.clone();
+        let completed_in_provider = completed.clone();
+        let registration = publisher.register_interval_snapshot(
+            "path/in-flight",
+            Arc::new(move || {
+                entered_in_provider.fetch_add(1, Ordering::Relaxed);
+                assert!(
+                    shared_weak
+                        .upgrade()
+                        .is_some_and(|shared| shared.interval_sources.try_lock().is_ok()),
+                    "snapshot callbacks run outside the source map lock"
+                );
+                let retired = registration_slot_weak
+                    .upgrade()
+                    .and_then(|slot| slot.lock().unwrap().take());
+                drop(retired);
+                completed_in_provider.fetch_add(1, Ordering::Relaxed);
+                Some(json!({ "state": "up" }))
+            }),
+        );
+        *registration_slot.lock().unwrap() = Some(registration);
+
+        let now = tokio::time::Instant::now();
+        let mut due = [(0, now - Duration::from_millis(1), interval)];
+        publish_due_intervals(&shared, &mut due);
+        assert_eq!(entered.load(Ordering::Relaxed), 1);
+        assert_eq!(completed.load(Ordering::Relaxed), 1);
+        assert!(shared.interval_sources.lock().unwrap().is_empty());
+
+        due[0].1 = tokio::time::Instant::now() - Duration::from_millis(1);
+        publish_due_intervals(&shared, &mut due);
+        assert_eq!(entered.load(Ordering::Relaxed), 1);
+        assert_eq!(completed.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(start_paused = true)]

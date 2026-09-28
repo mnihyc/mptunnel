@@ -1075,7 +1075,7 @@ transmission modes and not desired memory occupancy.
 | `max_ack_ranges` | 256 |
 | `max_paths` | 64 |
 | `max_streams` | 65,536 |
-| `max_quic_concurrent_bidi_streams` | 65,536 |
+| `max_quic_concurrent_bidi_streams` | 131,073 |
 | `max_stream_window_bytes` | 64 MiB |
 | `max_repair_bytes` | 64 MiB |
 | `max_reorder_bytes` | 64 MiB |
@@ -1085,6 +1085,7 @@ transmission modes and not desired memory occupancy.
 | `max_datagram_queue_bytes` | 16 MiB |
 | `max_path_flight_bytes` | 64 MiB |
 | `max_reliable_relay_chunk_bytes` | 512 KiB |
+| `max_response_prefetch_bytes` | Unset (no additional cap) |
 | `tcp_path_heartbeat_interval_s` | 10 s |
 | `tcp_path_heartbeat_timeout_s` | 30 s |
 | `quic_path_keep_alive_interval_s` | 10 s |
@@ -1118,6 +1119,24 @@ at 10 Gbps. They are configurable local bounds, not protocol constants. At
 10 Gbps and 100 ms RTT, a 64 MiB logical window has a rough 5.37 Gbps
 window/RTT ceiling and must be raised for line rate. Frame, payload, chunk, and
 sparse-range limits are separate safeguards and do not need to grow with BDP.
+
+`max_response_prefetch_bytes` optionally caps the unassigned response bytes
+staged by each MPP inbound target-relay stream for Throughput traffic. It counts
+original response data before a stream offset is assigned and limits source
+reads to the remaining cap and existing Product headroom. Queued data remains
+dispatchable while reads are paused; reads resume when queue space and Product
+headroom are available. When unset, this option adds no staging cap; existing
+Product and relay limits remain in force.
+
+A smaller value lowers the maximum unassigned source backlog but can split reads
+into smaller pieces, require more refills, and increase service CPU. Larger
+values can permit more source batching. Compare useful throughput, CPU per
+delivered byte, memory, and loaded latency for the workload. One MiB is an
+example ceiling equal to two default 512 KiB relay chunk allowances, not a
+recommended default or RTT/BDP target. Zero is invalid. The option does not
+change peer credit, Product or native flight; cap response data after offset
+assignment, aggregate session memory, or process RSS; or alter request-source,
+direct-flow, Latency, Control, or Realtime policy.
 
 Each proxy outbound has its own `connect_timeout_s`; the default is 10 seconds.
 Its required `endpoint` is `HOST:PORT`, with brackets around IPv6. When

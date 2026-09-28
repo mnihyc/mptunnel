@@ -80,6 +80,10 @@ pub struct ResourceLimits {
     pub max_datagram_queue_bytes: usize,
     pub max_path_flight_bytes: usize,
     pub max_reliable_relay_chunk_bytes: usize,
+    /// Optional server-side ceiling for original response bytes staged before
+    /// stream-offset assignment. This is independent of Product and native
+    /// flight limits.
+    pub max_response_prefetch_bytes: Option<usize>,
     pub tcp_path_heartbeat_interval: Duration,
     pub tcp_path_heartbeat_timeout: Duration,
     pub quic_path_keep_alive_interval: Duration,
@@ -105,6 +109,7 @@ impl Default for ResourceLimits {
             max_datagram_queue_bytes: DEFAULT_DATAGRAM_QUEUE_BYTES,
             max_path_flight_bytes: DEFAULT_PATH_FLIGHT_BYTES,
             max_reliable_relay_chunk_bytes: DEFAULT_MAX_RELIABLE_RELAY_CHUNK_BYTES,
+            max_response_prefetch_bytes: None,
             tcp_path_heartbeat_interval: DEFAULT_TCP_PATH_HEARTBEAT_INTERVAL,
             tcp_path_heartbeat_timeout: DEFAULT_TCP_PATH_HEARTBEAT_TIMEOUT,
             quic_path_keep_alive_interval: DEFAULT_QUIC_PATH_KEEP_ALIVE_INTERVAL,
@@ -162,6 +167,9 @@ impl ResourceLimits {
         }
         if self.max_reliable_relay_chunk_bytes > self.max_payload_bytes {
             return Err(ResourceLimitError::MaxReliableRelayChunkExceedsPayloadLimit);
+        }
+        if self.max_response_prefetch_bytes == Some(0) {
+            return Err(ResourceLimitError::MaxResponsePrefetchBytesZero);
         }
         if self.max_path_flight_bytes < self.max_reliable_relay_chunk_bytes {
             return Err(ResourceLimitError::PathFlightLimitTooSmall);
@@ -224,6 +232,7 @@ pub enum ResourceLimitError {
     DatagramQueueLimitTooSmall,
     MaxReliableRelayChunkBytesZero,
     MaxReliableRelayChunkExceedsPayloadLimit,
+    MaxResponsePrefetchBytesZero,
     PathFlightLimitTooSmall,
     PathFlightLimitExceedsReinjectionLimit,
     TcpPathHeartbeatIntervalZero,
@@ -281,6 +290,10 @@ impl std::fmt::Display for ResourceLimitError {
             Self::MaxReliableRelayChunkExceedsPayloadLimit => write!(
                 f,
                 "max reliable relay chunk bytes must be no greater than max payload bytes"
+            ),
+            Self::MaxResponsePrefetchBytesZero => write!(
+                f,
+                "max response prefetch bytes must be greater than zero when configured"
             ),
             Self::PathFlightLimitTooSmall => {
                 write!(f, "max path flight bytes must be at least one relay chunk")

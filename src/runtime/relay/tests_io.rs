@@ -66,6 +66,48 @@ fn assert_source_payload(payload: &Bytes, start: usize) {
     );
 }
 
+#[tokio::test]
+async fn successful_source_read_transfers_length_but_preserves_private_fill_capacity() {
+    use crate::mux::stream::ReliableSendStream;
+    use crate::runtime::sender::{
+        ReliableRelaySenderQueue, reliable_relay_sender_queue_read_budget,
+    };
+
+    let send_stream = ReliableSendStream::new(StreamId(7), MuxLimits::default());
+    let queue = ReliableRelaySenderQueue::default();
+    for grant in [1, 16, 64] {
+        let mut source = ChunkedSourceProbe {
+            position: 0,
+            end: 128,
+            chunk_bytes: 16,
+            read_limit: grant,
+            pending_once: false,
+        };
+        let mut buffer = bytes::BytesMut::with_capacity(64);
+        let capacity = buffer.capacity();
+        let (read, payload) = read_reliable_relay_payload(&mut source, &mut buffer, grant, 64)
+            .await
+            .expect("first source read");
+        let payload = payload.expect("positive source read");
+        assert!(read > 0);
+        assert_source_payload(&payload, 0);
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(read + buffer.capacity(), capacity);
+        assert_eq!(payload.as_ptr() as usize + read, buffer.as_ptr() as usize);
+        assert_eq!(
+            reliable_relay_sender_queue_read_budget(&send_stream, &queue, 64, buffer.len()),
+            0,
+            "the former secondary budget cannot admit a read",
+        );
+        assert!(
+            reliable_relay_sender_queue_read_budget(&send_stream, &queue, 64, buffer.capacity())
+                > 0,
+            "source credit and private fill capacity still permit progress",
+        );
+        assert!(source.position < source.end, "an empty buffer is not EOF");
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SourceAllocationInterval {
     start: usize,

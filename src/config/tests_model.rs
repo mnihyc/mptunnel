@@ -464,6 +464,10 @@ fn app_config_maps_engine_resource_errors_to_product_config_errors() {
         ConfigError::from(crate::performance::ResourceLimitError::QuicPathIdleTimeoutTooSmall),
         ConfigError::QuicPathIdleTimeoutTooSmall
     );
+    assert_eq!(
+        ConfigError::from(crate::performance::ResourceLimitError::MaxResponsePrefetchBytesZero),
+        ConfigError::MaxResponsePrefetchBytesZero
+    );
 }
 
 #[test]

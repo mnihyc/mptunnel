@@ -22,6 +22,11 @@ level = "info" # all levels are good
 [resources]
 # Per-QUIC-path loss metadata ceiling, not preallocated; exhaustion uses raw BBR3 loss decisions.
 # max_quic_loss_journal_bytes = 67108864
+# Optional per-stream cap for unassigned throughput-class target responses on
+# this MPP inbound. Smaller caps may reduce local memory/tails but add refill
+# CPU; larger caps allow more batching. This does not cap retained data or
+# session memory. 1 MiB equals two default quanta; choose from measurements.
+# max_response_prefetch_bytes = 1048576
 
 [admission]
 max_live_flows = 4096

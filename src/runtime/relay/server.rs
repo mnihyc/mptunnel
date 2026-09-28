@@ -99,6 +99,7 @@ pub(in crate::runtime) struct ServerReliableRelayContext {
     pub(in crate::runtime) inbound: InboundId,
     pub(in crate::runtime) performance: MppPerformanceConfig,
     pub(in crate::runtime) mux_limits: MuxLimits,
+    pub(in crate::runtime) max_response_prefetch_bytes: Option<usize>,
     pub(in crate::runtime) max_paths_per_session: usize,
     pub(in crate::runtime) session_retention_timeout: Duration,
     pub(in crate::runtime) flow_idle_timeout: Option<Duration>,
@@ -412,16 +413,41 @@ fn reliable_relay_current_data_ack_outstanding_bytes(
 }
 
 fn reliable_relay_response_source_staging_headroom(
-    _lane: TrafficClass,
+    lane: TrafficClass,
     product_window_bytes: usize,
     retained_product_bytes: usize,
     queued_original_data_bytes: usize,
+    max_response_prefetch_bytes: Option<usize>,
 ) -> usize {
     // `product_window_bytes` is already the chosen exact output tier's sum P,
     // bounded by the stream/reorder/repair resource envelope. Source bytes do
     // not acquire another authority before Data Sequence assignment.
-    product_window_bytes
-        .saturating_sub(retained_product_bytes.saturating_add(queued_original_data_bytes))
+    let product_headroom = product_window_bytes
+        .saturating_sub(retained_product_bytes.saturating_add(queued_original_data_bytes));
+    // The optional cap is a bulk-response staging policy. Preserve latency,
+    // control, and realtime service exactly when those classes are selected.
+    if !lane.is_bulk() {
+        return product_headroom;
+    }
+    max_response_prefetch_bytes.map_or(product_headroom, |limit| {
+        product_headroom.min(limit.saturating_sub(queued_original_data_bytes))
+    })
+}
+
+/// Additional reads are part of the explicitly enabled Throughput prefetch
+/// policy, not the default relay selection. The initialized prefix has already
+/// been frozen into an immutable queued payload: `buffer.len()` is zero while
+/// `buffer.capacity()` is the exclusively owned, disjoint unused suffix.
+/// Returning zero before taking Product's lock avoids the old no-op read path.
+fn response_ready_prefetch_capacity(
+    lane: TrafficClass,
+    max_response_prefetch_bytes: Option<usize>,
+    buffer: &bytes::BytesMut,
+) -> usize {
+    if !lane.is_bulk() || max_response_prefetch_bytes.is_none() {
+        return 0;
+    }
+    buffer.capacity()
 }
 
 fn reliable_relay_tail_reinjection_deadline(
@@ -3087,6 +3113,7 @@ where
                 inflight_limit,
                 data_ack_outstanding_bytes,
                 response_sender.data_bytes(),
+                context.max_response_prefetch_bytes,
             );
             // Source bytes do not receive a data sequence or path assignment until
             // dispatch; exact chosen-tier Product P and retained/queued Product O
@@ -4094,6 +4121,15 @@ where
                 }
                 let mut opportunistic_reads = 1usize;
                 while local_open && opportunistic_reads < sender_dispatch_item_budget {
+                    let ready_capacity = response_ready_prefetch_capacity(
+                        response_lane, context.max_response_prefetch_bytes, &buf,
+                    );
+                    if ready_capacity == 0 {
+                        break;
+                    }
+                    // This turn can consume only the current allocation's unused
+                    // suffix. Replenishing backing storage waits for the next
+                    // outer selection, which can service feedback/control first.
                     // A writer may have claimed source while the socket was
                     // serviced. Re-read U/O/credit, then release Product before
                     // the actual reservation/read future is even constructed.
@@ -4109,10 +4145,14 @@ where
                                 product.send_stream.data_ack_frontier(),
                             );
                             let headroom = reliable_relay_response_source_staging_headroom(
-                                response_lane, inflight_limit, outstanding, product.sender.data_bytes(),
+                                response_lane,
+                                inflight_limit,
+                                outstanding,
+                                product.sender.data_bytes(),
+                                context.max_response_prefetch_bytes,
                             );
                             product.sender.read_budget(
-                                &product.send_stream, sender_queue_limit, buf.len(),
+                                &product.send_stream, sender_queue_limit, ready_capacity,
                             ).min(headroom)
                         }
                     };

@@ -156,6 +156,7 @@ async fn server_data_ack_is_offered_before_first_target_write_completes() {
         inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         performance: MppPerformanceConfig::default(),
         mux_limits: limits,
+        max_response_prefetch_bytes: None,
         max_paths_per_session: ResourceLimits::default().max_paths,
         session_retention_timeout: Duration::from_secs(60),
         flow_idle_timeout: None,
@@ -508,6 +509,7 @@ async fn server_feedback_fanout_retries_blocked_sibling_during_retained_write() 
         inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         performance: MppPerformanceConfig::default(),
         mux_limits: limits,
+        max_response_prefetch_bytes: None,
         max_paths_per_session: ResourceLimits::default().max_paths,
         session_retention_timeout: Duration::from_secs(60),
         flow_idle_timeout: None,
@@ -809,6 +811,7 @@ async fn response_actor_eof_waits_for_prepared_original_and_retains_post_fin_rec
         inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         performance: MppPerformanceConfig::default(),
         mux_limits: limits,
+        max_response_prefetch_bytes: None,
         max_paths_per_session: ResourceLimits::default().max_paths,
         session_retention_timeout: Duration::from_secs(60),
         flow_idle_timeout: None,
@@ -1196,6 +1199,7 @@ async fn stream_owned_requalification_ack_capacity_release_wakes_an_idle_respons
         inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         performance: MppPerformanceConfig::default(),
         mux_limits: limits,
+        max_response_prefetch_bytes: None,
         max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
         session_retention_timeout: Duration::from_secs(60),
         flow_idle_timeout: None,
@@ -1366,6 +1370,7 @@ async fn exact_requalification_capacity_release_wakes_an_open_idle_source() {
         inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         performance: MppPerformanceConfig::default(),
         mux_limits: limits,
+        max_response_prefetch_bytes: None,
         max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
         session_retention_timeout: Duration::from_secs(60),
         flow_idle_timeout: None,
@@ -1718,6 +1723,7 @@ async fn assert_server_terminal_reconciliation(wake: TerminalReconciliationWake)
         inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         performance: MppPerformanceConfig::default(),
         mux_limits: limits,
+        max_response_prefetch_bytes: None,
         max_paths_per_session: ResourceLimits::default().max_paths,
         session_retention_timeout: Duration::from_secs(60),
         flow_idle_timeout: None,
@@ -1889,6 +1895,7 @@ async fn assert_post_resolution_denial_is_logical_stream_local(
         inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         performance: MppPerformanceConfig::default(),
         mux_limits: limits,
+        max_response_prefetch_bytes: None,
         max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
         session_retention_timeout: Duration::from_secs(1),
         flow_idle_timeout: None,
@@ -2073,6 +2080,7 @@ async fn server_relay_expires_only_after_its_absolute_no_output_interval() {
         inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         performance: MppPerformanceConfig::default(),
         mux_limits: limits,
+        max_response_prefetch_bytes: None,
         max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
         session_retention_timeout: Duration::from_millis(100),
         flow_idle_timeout: None,
@@ -2142,6 +2150,7 @@ async fn server_relay_applies_path_detach_after_request_half_close_without_respo
         inbound: InboundId::parse("test-inbound").expect("inbound ID"),
         performance: MppPerformanceConfig::default(),
         mux_limits: limits,
+        max_response_prefetch_bytes: None,
         max_paths_per_session: crate::performance::ResourceLimits::default().max_paths,
         // This test must observe lifecycle progress without relying on Product
         // expiry to close the actor's ordered event receiver.
@@ -3453,6 +3462,7 @@ fn response_source_staging_uses_exact_retained_product_debt_in_every_lane() {
                 aggregate_product_window,
                 retained_product_debt,
                 queued_original_data,
+                None,
             ),
             16 * 1024,
             "retained exact Product O and queued OriginalData consume the same aggregate P before assignment in {lane:?}",
@@ -3463,6 +3473,7 @@ fn response_source_staging_uses_exact_retained_product_debt_in_every_lane() {
                 aggregate_product_window,
                 0,
                 queued_original_data,
+                None,
             ),
             aggregate_product_window - queued_original_data,
             "MPP DataACK release must reopen source reads in {lane:?}",
@@ -3498,6 +3509,122 @@ fn response_source_staging_uses_exact_retained_product_debt_in_every_lane() {
             0,
         );
     }
+}
+
+#[test]
+fn response_prefetch_cap_limits_only_unassigned_source_queue_bytes() {
+    let lane = TrafficClass::Throughput;
+
+    assert_eq!(
+        reliable_relay_response_source_staging_headroom(lane, 100, 10, 20, None),
+        70,
+        "omitting the option preserves the legacy Product headroom",
+    );
+    for latency_sensitive_lane in [
+        TrafficClass::Control,
+        TrafficClass::Latency,
+        TrafficClass::RealtimeDatagram,
+    ] {
+        assert_eq!(
+            reliable_relay_response_source_staging_headroom(
+                latency_sensitive_lane,
+                100,
+                10,
+                20,
+                Some(50),
+            ),
+            70,
+            "the bulk-prefetch option does not change {latency_sensitive_lane:?} reads",
+        );
+    }
+    assert_eq!(
+        reliable_relay_response_source_staging_headroom(lane, 100, 10, 20, Some(50)),
+        30,
+        "the local cap reserves only the remaining Q allowance",
+    );
+    assert_eq!(
+        reliable_relay_response_source_staging_headroom(lane, 100, 10, 50, Some(50)),
+        0,
+        "a full queue stops further source reads",
+    );
+    assert_eq!(
+        reliable_relay_response_source_staging_headroom(lane, 100, 10, 60, Some(50)),
+        0,
+        "saturating headroom remains zero if queued bytes already exceed the cap",
+    );
+    assert_eq!(
+        reliable_relay_response_source_staging_headroom(lane, 25, 10, 10, Some(100)),
+        5,
+        "the existing Product authority remains the tighter bound",
+    );
+    assert_eq!(
+        reliable_relay_response_source_staging_headroom(lane, 100, 80, 0, Some(50)),
+        20,
+        "the prefetch ceiling does not cap retained Product debt I",
+    );
+}
+
+#[tokio::test]
+async fn tiny_response_prefetch_cap_reopens_reads_before_observing_eof() {
+    let cap = 64;
+    let source_bytes = Bytes::from(vec![0x6d; 160]);
+    let (mut target, mut source) = tokio::io::duplex(source_bytes.len());
+    target
+        .write_all(&source_bytes)
+        .await
+        .expect("write target response bytes");
+    target.shutdown().await.expect("target response EOF");
+
+    let mut buffer = bytes::BytesMut::with_capacity(cap);
+    let mut queued_original_bytes = 0;
+    let mut retained_product_bytes = 0;
+    let mut observed_source_bytes = bytes::BytesMut::new();
+    let mut observed_eof = false;
+
+    for _ in 0..8 {
+        let read_budget = reliable_relay_response_source_staging_headroom(
+            TrafficClass::Throughput,
+            1024,
+            retained_product_bytes,
+            queued_original_bytes,
+            Some(cap),
+        )
+        .min(cap);
+        if read_budget == 0 {
+            assert_eq!(queued_original_bytes, cap);
+            assert!(!observed_eof);
+            // Model a normal prepared-original claim: Q leaves the source
+            // queue and becomes retained Product debt I without releasing P.
+            retained_product_bytes += queued_original_bytes;
+            queued_original_bytes = 0;
+            continue;
+        }
+
+        let (read, payload) =
+            read_reliable_relay_payload(&mut source, &mut buffer, read_budget, read_budget)
+                .await
+                .expect("bounded target response read");
+        if read == 0 {
+            observed_eof = true;
+            break;
+        }
+        assert!(read <= read_budget);
+        queued_original_bytes += read;
+        assert!(queued_original_bytes <= cap);
+        observed_source_bytes.extend_from_slice(
+            payload
+                .as_deref()
+                .expect("positive source read returns payload"),
+        );
+    }
+
+    assert!(observed_eof, "space reopened enough times to reach EOF");
+    assert_eq!(observed_source_bytes.as_ref(), source_bytes.as_ref());
+    assert_eq!(
+        queued_original_bytes, 32,
+        "EOF leaves the final staged suffix queued"
+    );
+    assert_eq!(retained_product_bytes, 2 * cap);
 }
 
 #[test]
@@ -7975,11 +8102,48 @@ async fn server_target_backpressure_services_ack_and_detach_before_target_delive
     use crate::runtime::path::prepared::PreparedOriginalClaim;
     use std::future::{Future, poll_fn};
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
+
+    struct ScriptedReader {
+        receiver: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+        remainder: Option<Bytes>,
+        bytes_read: Arc<AtomicUsize>,
+        pending_observed: Arc<AtomicBool>,
+    }
+    impl AsyncRead for ScriptedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if buffer.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let bytes = match self.remainder.take() {
+                Some(bytes) => bytes,
+                None => match Pin::new(&mut self.receiver).poll_recv(cx) {
+                    Poll::Pending => {
+                        self.pending_observed.store(true, Ordering::Release);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(None) => return Poll::Ready(Ok(())),
+                    Poll::Ready(Some(bytes)) => bytes,
+                },
+            };
+            let count = buffer.remaining().min(bytes.len());
+            buffer.put_slice(&bytes[..count]);
+            self.bytes_read.fetch_add(count, Ordering::Release);
+            if count < bytes.len() {
+                self.remainder = Some(bytes.slice(count..));
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
 
     struct WriteObserved {
         inner: tokio::io::DuplexStream,
+        reader: ScriptedReader,
         accepted: Arc<AtomicUsize>,
         pending_polls: Arc<AtomicUsize>,
         flushed: Arc<AtomicUsize>,
@@ -8006,7 +8170,7 @@ async fn server_target_backpressure_services_ack_and_detach_before_target_delive
             cx: &mut Context<'_>,
             buffer: &mut tokio::io::ReadBuf<'_>,
         ) -> Poll<std::io::Result<()>> {
-            Pin::new(&mut self.inner).poll_read(cx, buffer)
+            Pin::new(&mut self.reader).poll_read(cx, buffer)
         }
     }
     impl AsyncWrite for WriteObserved {
@@ -8099,6 +8263,7 @@ async fn server_target_backpressure_services_ack_and_detach_before_target_delive
             inbound: InboundId::parse("test-inbound").expect("inbound"),
             performance: MppPerformanceConfig::default(),
             mux_limits: limits,
+            max_response_prefetch_bytes: Some(64),
             max_paths_per_session: ResourceLimits::default().max_paths,
             // As in the existing lifecycle fixture, expiry must not supply the
             // observed detach completion. No Product idle timeout is installed.
@@ -8141,6 +8306,15 @@ async fn server_target_backpressure_services_ack_and_detach_before_target_delive
         let mut accepted = accepted_rx.recv().await.expect("accepted Product");
         let retirement = accepted.supervise();
         let send_buffer = accepted.session_send_buffer();
+        // Leave one bounded source-read window for the relay while occupying the
+        // rest with a real session permit. This exercises actual refund and
+        // cancellation behavior at the production reserve/read boundary.
+        let available_for_source = 4;
+        assert!(send_buffer.limit_bytes() > available_for_source);
+        let held_bytes = send_buffer.limit_bytes() - available_for_source;
+        let mut held_waiter = send_buffer.subscribe();
+        let held_permit = send_buffer.reserve(&mut held_waiter, held_bytes).await;
+        assert_eq!(held_permit.bytes(), held_bytes);
         let mut path_stream = accepted.take_stream();
         let ReliablePathStreamOutput::Switchable(binding) = &path_stream.output else {
             panic!("registry-backed Product output");
@@ -8156,25 +8330,39 @@ async fn server_target_backpressure_services_ack_and_detach_before_target_delive
         let initial_grant = reliable_stream_initial_advertised_window_bytes(key.underlay, lane, limits);
         assert!(initial_grant >= 4);
         assert_eq!(path_stream.publish_max_data(initial_grant).max_data.published_offset, Some(initial_grant));
-        port.route_frame(&registration, stream_id, Frame::StreamMaxData { stream_id, max_offset: 1 })
-            .await.expect("peer permits one actual response byte");
+        port.route_frame(&registration, stream_id, Frame::StreamMaxData { stream_id, max_offset: 64 })
+            .await.expect("peer permits the bounded actual response reads");
+        let (source_tx, source_rx) = tokio::sync::mpsc::unbounded_channel();
+        source_tx.send(Bytes::from_static(b"r")).expect("first ready target chunk");
+        source_tx.send(Bytes::from_static(b"s")).expect("second ready target chunk");
+        let source_bytes_read = Arc::new(AtomicUsize::new(0));
+        let source_pending = Arc::new(AtomicBool::new(false));
         let (mut application, relay_side) = tokio::io::duplex(1);
-        application.write_all(b"r").await.expect("real target response source");
         let written = Arc::new(AtomicUsize::new(0));
         let pending = Arc::new(AtomicUsize::new(0));
         let flushed = Arc::new(AtomicUsize::new(0));
         let mut close = ServerRelayClose { sent: false, lane };
         let mut relay = Box::pin(relay_reliable_stream_body(
             WriteObserved {
-                inner: relay_side, accepted: written.clone(), pending_polls: pending.clone(),
+                inner: relay_side,
+                reader: ScriptedReader {
+                    receiver: source_rx,
+                    remainder: None,
+                    bytes_read: source_bytes_read.clone(),
+                    pending_observed: source_pending.clone(),
+                },
+                accepted: written.clone(), pending_polls: pending.clone(),
                 flushed: flushed.clone(), binding: binding.clone(), receive_window: initial_grant,
             },
-            &mut path_stream, &context, session_id, send_buffer, &mut close,
+            &mut path_stream, &context, session_id, send_buffer.clone(), &mut close,
         ));
 
-        // Use the current real prepared-source writer claim. This publishes an
-        // actual response Original; no synthetic flight or fabricated ACK range.
-        let original: Frame = loop {
+        // Claim actual prepared Originals before waking the source again. The
+        // asserted output bytes are independent of how many reads this actor's
+        // current item budget schedules in a single selection.
+        let mut originals = Vec::new();
+        let mut response_bytes = Vec::new();
+        while response_bytes.len() < 2 {
             let command = tokio::select! {
                 result = relay.as_mut() => panic!("response source Product ended: {result:?}"),
                 command = recv_reliable_path_command(&mut receiver) => command.expect("response command"),
@@ -8185,7 +8373,20 @@ async fn server_target_backpressure_services_ack_and_detach_before_target_delive
                     PreparedOriginalClaim::Claimed(frame) => {
                         let bytes = receiver.register_claimed_writer_frame(&frame);
                         receiver.release_pending_command_bytes(bytes);
-                        break frame;
+                        // The real writer requeues the coalesced source notice
+                        // after staging each successful claim. This fixture
+                        // completes the claimed frame immediately, so preserve
+                        // that transition before waiting for the next source
+                        // chunk.
+                        work.requeue();
+                        let Frame::StreamData { stream_id: id, offset, payload } = &frame else {
+                            panic!("prepared response claim is DATA");
+                        };
+                        assert_eq!(*id, stream_id);
+                        assert_eq!(*offset, response_bytes.len() as u64);
+                        assert_eq!(binding.original_flight_outputs_overlapping_frame(&frame), vec![(key, old.incarnation)]);
+                        response_bytes.extend_from_slice(payload);
+                        originals.push(frame);
                     }
                     PreparedOriginalClaim::Busy(wait) => {
                         receiver.defer_prepared_work(work, wait);
@@ -8201,13 +8402,57 @@ async fn server_target_backpressure_services_ack_and_detach_before_target_delive
                 receiver.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
                 assert!(!matches!(command, ReliablePathCommand::SendFrame(Frame::StreamData { .. })));
             }
+        }
+        assert_eq!(response_bytes, b"rs");
+
+        // Wait for the real source to report Pending before waking it. This is a
+        // reader event, not a presumed number of inner or outer polls. The held
+        // session quota leaves at most two bytes for the next successful read.
+        drive_until(relay.as_mut(), || source_pending.load(Ordering::Acquire)).await;
+        assert_eq!(source_bytes_read.load(Ordering::Acquire), 2);
+        source_tx.send(Bytes::from_static(b"xy")).expect("wake the outer source read");
+        let third_original: Frame = loop {
+            let command = tokio::select! {
+                result = relay.as_mut() => panic!("response source Product ended: {result:?}"),
+                command = recv_reliable_path_command(&mut receiver) => command.expect("response command"),
+            };
+            if let ReliablePathCommand::PreparedOriginal(work) = command {
+                let ready = receiver.writer_ready_boundary(work.path_instance_id()).expect("idle writer boundary");
+                match work.try_claim(ready) {
+                    PreparedOriginalClaim::Claimed(frame) => {
+                        let bytes = receiver.register_claimed_writer_frame(&frame);
+                        receiver.release_pending_command_bytes(bytes);
+                        work.requeue();
+                        let Frame::StreamData { stream_id: id, offset, payload } = &frame else {
+                            panic!("prepared response claim is DATA");
+                        };
+                        assert_eq!((*id, *offset, payload.as_ref()), (stream_id, 2, b"xy".as_slice()));
+                        assert_eq!(binding.original_flight_outputs_overlapping_frame(&frame), vec![(key, old.incarnation)]);
+                        break frame;
+                    }
+                    PreparedOriginalClaim::Busy(wait) => receiver.defer_prepared_work(work, wait),
+                    PreparedOriginalClaim::Blocked(wait) => receiver.defer_prepared_work(work, wait),
+                    PreparedOriginalClaim::Empty => {}
+                    PreparedOriginalClaim::CarrierFailed(error) => panic!("fixture carrier: {error}"),
+                    PreparedOriginalClaim::RecoveryQueued => panic!("no earlier recovery source"),
+                }
+            } else {
+                receiver.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+                assert!(!matches!(command, ReliablePathCommand::SendFrame(Frame::StreamData { .. })));
+            }
         };
-        let Frame::StreamData { stream_id: id, offset, payload } = &original else { panic!("real response DATA"); };
-        assert_eq!((*id, *offset, payload.as_ref()), (stream_id, 0, b"r".as_slice()));
-        assert_eq!(binding.original_flight_outputs_overlapping_frame(&original), vec![(key, old.incarnation)]);
-        let mut peer = ReliableRecvStream::new_with_initial_max_offset(stream_id, limits, 1);
-        let delivered = peer.receive_data(*offset, payload.clone()).expect("peer receives real response");
-        assert_eq!(delivered.delivered.concat(), b"r");
+        originals.push(third_original);
+        assert_eq!(source_bytes_read.load(Ordering::Acquire), 4,
+            "the real relay resumes from the source wake within its two-byte session allowance");
+
+        let mut peer = ReliableRecvStream::new_with_initial_max_offset(stream_id, limits, 64);
+        let mut delivered_bytes = Vec::new();
+        for frame in &originals {
+            let Frame::StreamData { offset, payload, .. } = frame else { unreachable!() };
+            let delivered = peer.receive_data(*offset, payload.clone()).expect("peer receives real response");
+            delivered_bytes.extend_from_slice(&delivered.delivered.concat());
+        }
+        assert_eq!(delivered_bytes, b"rsxy");
         let response_ack = peer.ack_frames().into_iter().next().expect("actual peer receipt");
 
         port.route_frame(&registration, stream_id, Frame::StreamData {
@@ -8226,9 +8471,11 @@ async fn server_target_backpressure_services_ack_and_detach_before_target_delive
         // existing queued_ack_precedes_following_path_detach_at_stream_actor test
         // separately checks FIFO when ACK and detach are already queued together.
         port.route_frame(&registration, stream_id, response_ack).await.expect("actual response ACK");
-        drive_until(relay.as_mut(), || binding.original_flight_outputs_overlapping_frame(&original).is_empty()).await;
+        drive_until(relay.as_mut(), || originals.iter().all(|frame| binding.original_flight_outputs_overlapping_frame(frame).is_empty())).await;
         assert!(binding.has_output_incarnation(key, old.incarnation),
             "the ACK releases the real Original while its exact output still exists");
+        assert!(source_pending.load(Ordering::Acquire),
+            "the scripted source reported Pending before the later Ready wake");
         assert_eq!(written.load(Ordering::Acquire), 1, "target reads are still withheld");
         assert_eq!(flushed.load(Ordering::Acquire), 0);
         assert_eq!(binding.feedback_status().max_data.published_offset, Some(initial_grant));
@@ -8248,7 +8495,7 @@ async fn server_target_backpressure_services_ack_and_detach_before_target_delive
         assert_eq!(flushed.load(Ordering::Acquire), 0);
         assert_eq!(binding.feedback_status().max_data.published_offset, Some(initial_grant),
             "DATA receipt and completed lifecycle do not manufacture receive credit");
-        assert!(binding.original_flight_outputs_overlapping_frame(&original).is_empty());
+        assert!(originals.iter().all(|frame| binding.original_flight_outputs_overlapping_frame(frame).is_empty()));
 
         let (replacement, mut replacement_receiver) = reliable_path_command_channels(8);
         assert!(matches!(
@@ -8261,7 +8508,7 @@ async fn server_target_backpressure_services_ack_and_detach_before_target_delive
         assert_eq!(written.load(Ordering::Acquire), 1);
         assert_eq!(flushed.load(Ordering::Acquire), 0);
         assert_eq!(binding.feedback_status().max_data.published_offset, Some(initial_grant));
-        assert!(binding.original_flight_outputs_overlapping_frame(&original).is_empty(),
+        assert!(originals.iter().all(|frame| binding.original_flight_outputs_overlapping_frame(frame).is_empty()),
             "fresh output cannot inherit acknowledged predecessor flight");
 
         // Existing attachment replay carries the real cumulative request receipt
@@ -8294,11 +8541,15 @@ async fn server_target_backpressure_services_ack_and_detach_before_target_delive
         assert_eq!(flushed.load(Ordering::Acquire), 4);
         assert_eq!(binding.feedback_status().max_data.published_offset, Some(initial_grant + 4),
             "only the actually flushed request prefix releases receive credit");
-        assert!(binding.original_flight_outputs_overlapping_frame(&original).is_empty());
+        assert!(originals.iter().all(|frame| binding.original_flight_outputs_overlapping_frame(frame).is_empty()));
 
         // The Product remains open throughout. Destruction/supervision is
         // cleanup after the decisive observations, not the cause of admission.
         drop(relay);
+        assert_eq!(send_buffer.used_bytes(), held_bytes,
+            "ACK and actor cancellation release all session reservations from the ready/pending source path");
+        drop(held_permit);
+        assert_eq!(send_buffer.used_bytes(), 0, "the test's session permit is released");
         drop(path_stream);
         retirement.retire().await;
         drop(application);
@@ -8450,6 +8701,7 @@ async fn server_reset_terminates_pending_target_write_and_releases_retained_suff
             inbound: InboundId::parse("test-inbound").expect("inbound"),
             performance: MppPerformanceConfig::default(),
             mux_limits: limits,
+            max_response_prefetch_bytes: None,
             max_paths_per_session: ResourceLimits::default().max_paths,
             session_retention_timeout: Duration::from_secs(60),
             flow_idle_timeout: None,
@@ -8550,4 +8802,100 @@ async fn server_reset_terminates_pending_target_write_and_releases_retained_suff
     })
     .await
     .expect("existing one-second server relay settlement guard");
+}
+
+#[test]
+fn ready_prefetch_requires_explicit_bulk_policy_before_product_observation() {
+    let buffer = bytes::BytesMut::with_capacity(64);
+    assert!(buffer.is_empty());
+    assert!(buffer.capacity() >= 64);
+    for lane in [
+        TrafficClass::Control,
+        TrafficClass::Latency,
+        TrafficClass::RealtimeDatagram,
+    ] {
+        assert_eq!(response_ready_prefetch_capacity(lane, Some(64), &buffer), 0);
+    }
+    assert_eq!(
+        response_ready_prefetch_capacity(TrafficClass::Throughput, None, &buffer),
+        0,
+        "default policy must not enter a second source-read observation",
+    );
+    assert_eq!(
+        response_ready_prefetch_capacity(TrafficClass::Throughput, Some(64), &buffer),
+        buffer.capacity(),
+        "empty initialized length is not empty private spare capacity",
+    );
+}
+
+#[test]
+fn exhausted_prefetch_backing_returns_to_outer_selection() {
+    let mut buffer = bytes::BytesMut::with_capacity(64);
+    let capacity = buffer.capacity();
+    buffer.resize(capacity, 0x5a);
+    let retained = buffer.split_to(capacity).freeze();
+    assert_eq!(buffer.len(), 0);
+    assert_eq!(buffer.capacity(), 0);
+    assert_eq!(
+        response_ready_prefetch_capacity(TrafficClass::Throughput, Some(4096), &buffer),
+        0,
+        "a larger staging allowance must not renew backing inside the ready drain",
+    );
+    assert!(retained.iter().all(|&byte| byte == 0x5a));
+}
+
+#[tokio::test]
+async fn ready_prefetch_packs_one_private_suffix_then_observes_real_eof() {
+    let mut buffer = bytes::BytesMut::with_capacity(64);
+    let capacity = buffer.capacity();
+    let expected: Vec<_> = (0..capacity).map(|i| (i % 251) as u8).collect();
+    let (mut target, mut source) = tokio::io::duplex(capacity);
+    target.write_all(&expected).await.expect("source bytes");
+    target.shutdown().await.expect("source EOF");
+    let (first, payload) = read_reliable_relay_payload(&mut source, &mut buffer, 16, capacity)
+        .await
+        .expect("first read");
+    assert_eq!(first, 16);
+    let mut retained = vec![payload.expect("positive first read")];
+    assert!(buffer.is_empty());
+    let spare_at_turn_start = buffer.capacity();
+    assert_eq!(spare_at_turn_start, capacity - first);
+    let mut additional = 0;
+    loop {
+        let spare =
+            response_ready_prefetch_capacity(TrafficClass::Throughput, Some(capacity * 2), &buffer);
+        if spare == 0 {
+            break;
+        }
+        let cursor = buffer.as_ptr();
+        let grant = spare.min(7);
+        let (read, payload) = read_reliable_relay_payload(&mut source, &mut buffer, grant, spare)
+            .await
+            .expect("ready suffix read");
+        let payload = payload.expect("suffix contains source data");
+        assert_eq!(read, grant);
+        assert_eq!(
+            payload.as_ptr(),
+            cursor,
+            "no replacement backing in this turn"
+        );
+        assert_eq!(read + buffer.capacity(), spare);
+        assert!(buffer.is_empty());
+        additional += read;
+        retained.push(payload);
+    }
+    assert_eq!(additional, spare_at_turn_start);
+    let assembled: Vec<_> = retained.iter().flat_map(|p| p.iter().copied()).collect();
+    assert_eq!(assembled, expected);
+    // Exhausted local spare is not EOF. Only a subsequent outer read observes it.
+    let (read, payload) = read_reliable_relay_payload(&mut source, &mut buffer, 16, capacity)
+        .await
+        .expect("real EOF");
+    assert_eq!(read, 0);
+    assert!(payload.is_none());
+    let after: Vec<_> = retained.iter().flat_map(|p| p.iter().copied()).collect();
+    assert_eq!(
+        after, expected,
+        "replenishment cannot mutate published payloads"
+    );
 }

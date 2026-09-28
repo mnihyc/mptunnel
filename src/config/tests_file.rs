@@ -1730,6 +1730,30 @@ fn resource_file_config_preserves_explicit_quic_loss_journal_limit() {
 }
 
 #[test]
+fn response_prefetch_resource_is_optional_and_rejects_zero() {
+    assert_eq!(
+        ResourceFileConfig::default()
+            .into_limits()
+            .max_response_prefetch_bytes,
+        None,
+        "omission adds no response-source staging cap",
+    );
+
+    let explicit: ResourceFileConfig = toml::from_str("max_response_prefetch_bytes = 1048576")
+        .expect("positive response prefetch resource");
+    let limits = explicit.into_limits();
+    assert_eq!(limits.max_response_prefetch_bytes, Some(1_048_576));
+    limits.validate().expect("positive byte ceiling");
+
+    let zero: ResourceFileConfig = toml::from_str("max_response_prefetch_bytes = 0")
+        .expect("zero parses before resource validation");
+    assert_eq!(
+        zero.into_limits().validate(),
+        Err(crate::performance::ResourceLimitError::MaxResponsePrefetchBytesZero)
+    );
+}
+
+#[test]
 fn resource_file_config_derives_payload_and_chunk_from_frame_envelope() {
     let limits = ResourceFileConfig {
         max_frame_bytes: Some(4096),
@@ -2185,6 +2209,7 @@ retention_timeout_s = 45
 max_reinjection_cache_chunks = 101
 max_reorder_buffer_chunks = 102
 max_retained_receive_ranges = 103
+max_response_prefetch_bytes = 1048576
 tcp_path_heartbeat_interval_s = 2
 tcp_path_heartbeat_timeout_s = 7
 quic_path_keep_alive_interval_s = 3
@@ -2230,6 +2255,10 @@ outbound = "mpp"
     assert_eq!(config.resources.max_reinjection_cache_chunks, 101);
     assert_eq!(config.resources.max_reorder_buffer_chunks, 102);
     assert_eq!(config.resources.max_retained_receive_ranges, 103);
+    assert_eq!(
+        config.resources.max_response_prefetch_bytes,
+        Some(1_048_576)
+    );
 }
 
 #[test]
@@ -2315,16 +2344,17 @@ fn uncomment_documented_block(document: &str, start: &str, end: &str) -> String 
 
 #[test]
 fn shipped_configuration_documents_match_the_runtime_schema() {
-    let load = |contents: &str| {
-        let contents = contents
+    let resolve = |contents: &str| {
+        contents
             .replace("REPLACE_ME", "0123456789abcdef0123456789abcdef")
             .replace("server.example.com", "mptunnel.test")
             .replace("REPLACE_WITH_SERVER_CERT.pem", TEST_CERTIFICATE_FILE)
             .replace("server-cert.pem", TEST_CERTIFICATE_FILE)
             .replace("server-key.pem", TEST_PRIVATE_KEY_FILE)
-            .replace("mpp-transport.key", TEST_TRANSPORT_SECRET_FILE);
-        load_config_toml_str(&contents).expect("shipped configuration")
+            .replace("mpp-transport.key", TEST_TRANSPORT_SECRET_FILE)
     };
+    let load =
+        |contents: &str| load_config_toml_str(&resolve(contents)).expect("shipped configuration");
 
     let reference_document = include_str!("../../examples/config.reference.toml");
     assert!(
@@ -2332,6 +2362,105 @@ fn shipped_configuration_documents_match_the_runtime_schema() {
             .lines()
             .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#')),
         "the annotated reference must stay inert until copied into a role profile"
+    );
+    let response_prefetch_example = reference_document
+        .lines()
+        .find(|line| *line == "# max_response_prefetch_bytes = 1048576")
+        .expect("reference response-prefetch example")
+        .strip_prefix("# ")
+        .expect("commented reference setting");
+    let reference_resource: ResourceFileConfig = toml::from_str(response_prefetch_example)
+        .expect("reference resource setting follows the runtime schema");
+    let reference_limits = reference_resource.into_limits();
+    reference_limits
+        .validate()
+        .expect("valid reference resource limit");
+    assert_eq!(
+        reference_limits.max_response_prefetch_bytes,
+        Some(1_048_576)
+    );
+
+    let reference_profile = reference_document
+        .lines()
+        .map(|line| line.strip_prefix("#| ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let invalid_reference = reference_profile.replacen(
+        "max_payload_bytes =",
+        "unknown_reference_payload_bytes =",
+        1,
+    );
+    assert_ne!(invalid_reference, reference_profile);
+    assert!(matches!(
+        load_config_toml_str(&invalid_reference),
+        Err(ConfigFileError::Toml(_))
+    ));
+
+    let response_prefetch_profile = reference_profile.replacen(
+        "max_reliable_relay_chunk_bytes = 524288",
+        "max_reliable_relay_chunk_bytes = 524288\nmax_response_prefetch_bytes = 1048576",
+        1,
+    );
+    assert_ne!(response_prefetch_profile, reference_profile);
+    assert_eq!(
+        load(&response_prefetch_profile)
+            .resources
+            .max_response_prefetch_bytes,
+        Some(1_048_576),
+        "the canonical parser maps the documented optional field",
+    );
+    let misspelled_response_prefetch = response_prefetch_profile.replacen(
+        "max_response_prefetch_bytes = 1048576",
+        "max_response_prefetch_btyes = 1048576",
+        1,
+    );
+    assert_ne!(misspelled_response_prefetch, response_prefetch_profile);
+    assert!(matches!(
+        load_config_toml_str(&misspelled_response_prefetch),
+        Err(ConfigFileError::Toml(_))
+    ));
+    let zero_response_prefetch = response_prefetch_profile.replacen(
+        "max_response_prefetch_bytes = 1048576",
+        "max_response_prefetch_bytes = 0",
+        1,
+    );
+    assert_ne!(zero_response_prefetch, response_prefetch_profile);
+    assert!(matches!(
+        load_config_toml_str(&resolve(&zero_response_prefetch)),
+        Err(ConfigFileError::Config(
+            ConfigError::MaxResponsePrefetchBytesZero
+        ))
+    ));
+
+    let reference = load(&reference_profile);
+    assert_eq!(reference.session, SessionConfig::default());
+    assert_eq!(reference.resources, ResourceLimits::default());
+    let CommandConfig::Node(reference) = reference.command;
+    assert_eq!(reference.forwarding_mode, ForwardingMode::L4);
+    assert!(reference.servers.is_empty());
+    assert_eq!(reference.local_ingresses.len(), 2);
+    assert!(reference.tun_l3_ingresses.is_empty());
+    assert_eq!(mpp_outbounds(&reference)[0].paths.len(), 2);
+    assert_eq!(
+        mpp_outbounds(&reference)[0]
+            .performance
+            .optional_reinjection_budget_percent,
+        20
+    );
+    assert!(
+        mpp_outbounds(&reference)[0].paths[0]
+            .tls
+            .shared_transport_secret_configured()
+    );
+    assert_eq!(
+        reference
+            .product_policy
+            .as_ref()
+            .expect("reference Product policy")
+            .routes[0]
+            .action
+            .target_resolution(),
+        TargetResolutionMode::AsIs,
     );
 
     let client_document = include_str!("../../examples/client.toml");

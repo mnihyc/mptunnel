@@ -267,6 +267,7 @@ pub(super) fn new_identity_runtime_with_metadata(
                     inbound: inbound.clone(),
                     performance,
                     mux_limits,
+                    max_response_prefetch_bytes: resources.max_response_prefetch_bytes,
                     max_paths_per_session: resources.max_paths,
                     session_retention_timeout,
                     flow_idle_timeout,

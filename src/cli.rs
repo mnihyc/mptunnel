@@ -685,6 +685,7 @@ impl ResourceArgs {
             max_datagram_queue_bytes: self.max_datagram_queue_bytes,
             max_path_flight_bytes: self.max_path_flight_bytes,
             max_reliable_relay_chunk_bytes: self.max_reliable_relay_chunk_bytes,
+            max_response_prefetch_bytes: None,
             tcp_path_heartbeat_interval: self.tcp_path_heartbeat_interval_s.duration(),
             tcp_path_heartbeat_timeout: self.tcp_path_heartbeat_timeout_s.duration(),
             quic_path_keep_alive_interval: self.quic_path_keep_alive_interval_s.duration(),

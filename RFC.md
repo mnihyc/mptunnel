@@ -3567,6 +3567,34 @@ reads and each atomic service turn smaller, but it does not replace this
 Product byte authority. Staging grants no output ownership or native
 reservation; every assignment still passes the exact checks above.
 
+An implementation MAY configure a local `max_response_prefetch_bytes` ceiling
+for throughput-class response streams handled by an MPP inbound target relay.
+Let `S` be that configured positive byte value and `Q` the queued original
+response bytes that have not yet received a stream offset. The setting further
+limits source-read permission to the smaller of the existing Product headroom
+and `S - Q`, saturating at zero. This per-response-stream ceiling limits only
+unassigned source staging. It does not count or cap retained Product bytes
+after offset assignment, change `W`, `P_i`, shared session reservation, peer
+credit, ownership, path flight, or native congestion/admission. It does not
+apply to direct flows, request-source reads, or latency, control, and realtime
+traffic classes. A full queue remains dispatchable; later source reads resume
+when queue space and existing Product headroom are available. The value is local
+configuration, not negotiated or sent on the wire. Omission adds no ceiling and
+preserves the existing source-staging behavior. A configured zero is invalid.
+
+When this policy is enabled, an implementation that performs additional
+opportunistic source reads in the same service turn MUST use only the response
+stream's current exclusively owned unused buffer capacity for those reads.
+Each positive initialized prefix is frozen as an immutable queued payload
+before a later read uses the disjoint suffix. The implementation MUST stop
+when that capacity or existing queue/item limits are exhausted, or when the
+next source/permit operation would wait; it MUST NOT allocate replacement
+backing storage or wait for additional source data in this opportunistic drain.
+Replenishing storage and waiting for pending work remain with the outer service
+selection. Exhausting the suffix is not EOF; only a real subsequent source read
+can observe EOF. This is a local service-turn bound and grants no protocol
+credit or ownership.
+
 An authenticated admission-active attachment may precede its first exact-
 instance measurement. It remains unproven and uses only configured startup
 priors and startup-flight bounds. Absence of measurement is not absence of an

@@ -8,6 +8,7 @@ fn defaults_preserve_the_deployed_resource_envelope() {
     assert_eq!(limits.max_payload_bytes, 1_048_512);
     assert_eq!(limits.max_streams, 65_536);
     assert_eq!(limits.max_repair_bytes, 64 * 1024 * 1024);
+    assert_eq!(limits.max_response_prefetch_bytes, None);
     assert_eq!(limits.max_reinjection_cache_chunks, 65_536);
     assert_eq!(limits.max_reorder_buffer_chunks, 65_536);
     assert_eq!(limits.max_retained_receive_ranges, 65_536);
@@ -65,4 +66,17 @@ fn sparse_node_limits_must_be_nonzero() {
     ] {
         assert_eq!(limits.validate(), Err(expected));
     }
+}
+
+#[test]
+fn configured_response_prefetch_limit_must_be_positive() {
+    let limits = ResourceLimits {
+        max_response_prefetch_bytes: Some(0),
+        ..ResourceLimits::default()
+    };
+
+    assert_eq!(
+        limits.validate(),
+        Err(ResourceLimitError::MaxResponsePrefetchBytesZero)
+    );
 }

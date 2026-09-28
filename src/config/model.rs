@@ -2362,6 +2362,7 @@ pub enum ConfigError {
     DatagramQueueLimitTooSmall,
     MaxReliableRelayChunkBytesZero,
     MaxReliableRelayChunkExceedsPayloadLimit,
+    MaxResponsePrefetchBytesZero,
     PathFlightLimitTooSmall,
     PathFlightLimitExceedsReinjectionLimit,
     TcpPathHeartbeatIntervalZero,
@@ -2454,6 +2455,7 @@ impl From<ResourceLimitError> for ConfigError {
             ResourceLimitError::MaxReliableRelayChunkExceedsPayloadLimit => {
                 Self::MaxReliableRelayChunkExceedsPayloadLimit
             }
+            ResourceLimitError::MaxResponsePrefetchBytesZero => Self::MaxResponsePrefetchBytesZero,
             ResourceLimitError::PathFlightLimitTooSmall => Self::PathFlightLimitTooSmall,
             ResourceLimitError::PathFlightLimitExceedsReinjectionLimit => {
                 Self::PathFlightLimitExceedsReinjectionLimit
@@ -2564,6 +2566,10 @@ impl std::fmt::Display for ConfigError {
                     "max reliable relay chunk bytes must be no greater than max payload bytes"
                 )
             }
+            Self::MaxResponsePrefetchBytesZero => write!(
+                f,
+                "max response prefetch bytes must be greater than zero when configured"
+            ),
             Self::PathFlightLimitTooSmall => {
                 write!(f, "max path flight bytes must be at least one relay chunk")
             }

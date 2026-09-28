@@ -761,7 +761,7 @@ pub(in crate::runtime) fn reliable_relay_sender_queue_read_budget(
     send_stream: &ReliableSendStream,
     sender_queue: &ReliableRelaySenderQueue,
     queue_limit: usize,
-    buffer_len: usize,
+    source_read_limit: usize,
 ) -> usize {
     queue_limit
         .saturating_sub(sender_queue.bytes())
@@ -770,7 +770,7 @@ pub(in crate::runtime) fn reliable_relay_sender_queue_read_budget(
                 .send_credit_bytes()
                 .saturating_sub(sender_queue.data_bytes()),
         )
-        .min(buffer_len)
+        .min(source_read_limit)
 }
 
 #[cfg(test)]

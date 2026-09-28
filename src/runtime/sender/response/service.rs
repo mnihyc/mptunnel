@@ -1269,13 +1269,20 @@ impl ServerResponseSenderService {
         )
     }
 
+    /// The last argument is the maximum number of source bytes this read may
+    /// fill, not the initialized length of a buffer after its payload is frozen.
     pub(in crate::runtime) fn read_budget(
         &self,
         send_stream: &ReliableSendStream,
         queue_limit: usize,
-        buffer_len: usize,
+        source_read_limit: usize,
     ) -> usize {
-        reliable_relay_sender_queue_read_budget(send_stream, &self.queue, queue_limit, buffer_len)
+        reliable_relay_sender_queue_read_budget(
+            send_stream,
+            &self.queue,
+            queue_limit,
+            source_read_limit,
+        )
     }
 
     pub(in crate::runtime) fn enqueue_data_for_lane(

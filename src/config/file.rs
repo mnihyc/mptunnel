@@ -768,6 +768,7 @@ struct ResourceFileConfig {
     max_datagram_queue_bytes: Option<usize>,
     max_path_flight_bytes: Option<usize>,
     max_reliable_relay_chunk_bytes: Option<usize>,
+    max_response_prefetch_bytes: Option<usize>,
     tcp_path_heartbeat_interval_s: Option<ConfigSeconds>,
     tcp_path_heartbeat_timeout_s: Option<ConfigSeconds>,
     quic_path_keep_alive_interval_s: Option<ConfigSeconds>,
@@ -924,6 +925,7 @@ impl ResourceFileConfig {
             max_datagram_queue_bytes,
             max_path_flight_bytes,
             max_reliable_relay_chunk_bytes,
+            max_response_prefetch_bytes: self.max_response_prefetch_bytes,
             tcp_path_heartbeat_interval: self.tcp_path_heartbeat_interval_s.map_or(
                 defaults.tcp_path_heartbeat_interval,
                 ConfigSeconds::duration,

@@ -18,7 +18,10 @@
 use crate::protocol::OffsetRange;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Unbounded};
+use std::ops::{
+    Bound::{Excluded, Unbounded},
+    Range,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::runtime::stream) struct FlightIndexKey {
@@ -33,17 +36,30 @@ struct IntervalUnion {
 }
 
 impl IntervalUnion {
+    /// Return the slice of normalized, ordered ACK masks that can intersect
+    /// this union. An envelope is sufficient to skip only masks wholly before
+    /// its first byte or at/after its last byte; a long crossing range keeps
+    /// the envelope wide enough to remain visible.
+    fn relevant_mask_indices(&self, masks: &[OffsetRange]) -> Range<usize> {
+        if masks.len() <= 1 {
+            return 0..masks.len();
+        }
+        let Some((&first_start, _)) = self.ranges.first_key_value() else {
+            return 0..0;
+        };
+        let (_, &last_end) = self.ranges.last_key_value().expect("nonempty union");
+        let first = masks.partition_point(|mask| mask.end <= first_start);
+        let end = masks.partition_point(|mask| mask.start < last_end);
+        first..end
+    }
+
     fn add(&mut self, range: OffsetRange) {
         if range.is_empty() {
             return;
         }
-        let newly_covered = range.end.saturating_sub(range.start) as u128
-            - self
-                .intersections(range)
-                .into_iter()
-                .map(|piece| piece.end.saturating_sub(piece.start) as u128)
-                .sum::<u128>();
-        self.covered_bytes += newly_covered;
+        // Every old interval encountered by the merge is disjoint. Account
+        // only its overlap with the original input, not the expanded span.
+        let mut newly_covered = range.end.saturating_sub(range.start) as u128;
         let mut start = range.start;
         let mut end = range.end;
         if let Some((&prior_start, &prior_end)) = self.ranges.range(..=start).next_back()
@@ -63,8 +79,12 @@ impl IntervalUnion {
                     .ranges
                     .get_mut(&prior_start)
                     .expect("observed union range") = end;
+                self.covered_bytes += newly_covered;
                 return;
             }
+            newly_covered -= prior_end
+                .min(range.end)
+                .saturating_sub(prior_start.max(range.start)) as u128;
             start = prior_start;
             end = end.max(prior_end);
             self.ranges.remove(&prior_start);
@@ -77,10 +97,14 @@ impl IntervalUnion {
             })
             .collect::<Vec<_>>();
         for (next_start, next_end) in merged {
+            newly_covered -= next_end
+                .min(range.end)
+                .saturating_sub(next_start.max(range.start)) as u128;
             end = end.max(next_end);
             self.ranges.remove(&next_start);
         }
         self.ranges.insert(start, end);
+        self.covered_bytes += newly_covered;
     }
 
     fn intersections(&self, range: OffsetRange) -> Vec<OffsetRange> {
@@ -116,10 +140,9 @@ impl IntervalUnion {
             return;
         }
         let affected = self.overlapping_entries(range);
-        self.covered_bytes -= self
-            .intersections(range)
-            .into_iter()
-            .map(|piece| piece.end.saturating_sub(piece.start) as u128)
+        self.covered_bytes -= affected
+            .iter()
+            .map(|&(start, end)| end.min(range.end).saturating_sub(start.max(range.start)) as u128)
             .sum::<u128>();
         for (start, end) in affected {
             self.ranges.remove(&start);
@@ -381,12 +404,13 @@ impl IndexedFlightState {
 
     fn intersecting(&self, ranges: &[OffsetRange]) -> SmallVec<[FlightIndexKey; 4]> {
         let mut keys = SmallVec::new();
-        for &range in ranges {
+        let relevant = &ranges[self.covered.relevant_mask_indices(ranges)];
+        for &range in relevant {
             Node::query(&self.root, range, &mut keys);
         }
         // A single mask is queried once, and the tree visits in key order.
         // Multiple disjoint masks can select one long flight repeatedly.
-        if ranges.len() > 1 {
+        if relevant.len() > 1 {
             keys.sort_unstable();
             keys.dedup();
         }
@@ -394,21 +418,24 @@ impl IndexedFlightState {
     }
 
     fn ambiguous_intersections_for_ack(&self, ranges: &[OffsetRange]) -> Vec<OffsetRange> {
-        ranges
+        let relevant = self.ambiguous.relevant_mask_indices(ranges);
+        ranges[relevant]
             .iter()
             .flat_map(|&range| self.ambiguous.intersections(range))
             .collect()
     }
 
     fn acknowledge(&mut self, ranges: &[OffsetRange]) {
-        for &range in ranges {
+        let relevant = self.covered.relevant_mask_indices(ranges);
+        for &range in &ranges[relevant] {
             self.covered.subtract(range);
             self.ambiguous.subtract(range);
         }
     }
 
     fn ack_covers_all(&self, ranges: &[OffsetRange]) -> bool {
-        self.covered.subset_of_ranges(ranges)
+        let relevant = self.covered.relevant_mask_indices(ranges);
+        self.covered.subset_of_ranges(&ranges[relevant])
     }
 
     /// Rebuild just one touched ordered bucket after a split/removal. The
@@ -732,9 +759,169 @@ impl ProductFlightIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn r(start: u64, end: u64) -> OffsetRange {
         OffsetRange { start, end }
+    }
+
+    fn byte_set_ranges(bytes: &BTreeSet<u64>) -> Vec<OffsetRange> {
+        let mut ranges = Vec::<OffsetRange>::new();
+        for &byte in bytes {
+            if let Some(last) = ranges.last_mut()
+                && last.end == byte
+            {
+                last.end = byte + 1;
+                continue;
+            }
+            ranges.push(OffsetRange {
+                start: byte,
+                end: byte + 1,
+            });
+        }
+        ranges
+    }
+
+    #[test]
+    fn interval_union_mutations_match_bounded_byte_set_at_u64_edge() {
+        let base = u64::MAX - 24;
+        let operations = [
+            (true, r(base + 2, base + 10)),
+            (true, r(base + 15, u64::MAX)),
+            (true, r(base + 9, base + 16)),
+            (false, r(base + 4, base + 6)),
+            (false, r(base + 6, base + 8)),
+            (true, r(base + 4, base + 8)),
+            (false, r(base + 17, u64::MAX - 2)),
+            (true, r(u64::MAX - 1, u64::MAX)),
+            (false, r(base, base + 3)),
+            (true, r(base + 3, base + 3)),
+            (false, r(u64::MAX, u64::MAX)),
+            (true, r(base + 1, base + 2)),
+        ];
+        let mut union = IntervalUnion::default();
+        let mut oracle = BTreeSet::new();
+
+        for (add, range) in operations {
+            if add {
+                union.add(range);
+                oracle.extend(range.start..range.end);
+            } else {
+                union.subtract(range);
+                for byte in range.start..range.end {
+                    oracle.remove(&byte);
+                }
+            }
+
+            let expected = byte_set_ranges(&oracle);
+            assert_eq!(union.covered_bytes, oracle.len() as u128);
+            assert_eq!(union.intersections(r(base, u64::MAX)), expected);
+            assert!(
+                union.subset_of_ranges(&[r(base, u64::MAX)]),
+                "the full mask covers every retained byte"
+            );
+            assert_eq!(
+                union.subset_of_ranges(&[]),
+                oracle.is_empty(),
+                "empty masks cover only an empty union"
+            );
+
+            let partial_masks = [r(base, base + 8), r(base + 14, u64::MAX)];
+            let expected_subset = oracle.iter().all(|byte| {
+                partial_masks
+                    .iter()
+                    .any(|mask| mask.start <= *byte && *byte < mask.end)
+            });
+            assert_eq!(union.subset_of_ranges(&partial_masks), expected_subset);
+        }
+    }
+
+    #[test]
+    fn union_insertions_match_byte_set_and_full_width_coverage() {
+        for base in [0, u64::MAX - 6] {
+            for coverage_bits in 0u64..64 {
+                let bytes = (0..6)
+                    .filter(|bit| coverage_bits & (1 << bit) != 0)
+                    .map(|bit| base + bit)
+                    .collect::<BTreeSet<_>>();
+                let mut initial = IntervalUnion::default();
+                for covered in byte_set_ranges(&bytes) {
+                    initial.add(covered);
+                }
+                for start in 0..=6 {
+                    for end in start..=6 {
+                        let mut union = initial.clone();
+                        union.add(r(base + start, base + end));
+                        let mut expected = bytes.clone();
+                        expected.extend(base + start..base + end);
+                        assert_eq!(union.covered_bytes, expected.len() as u128);
+                        assert_eq!(
+                            union.intersections(r(base, base + 6)),
+                            byte_set_ranges(&expected)
+                        );
+                    }
+                }
+            }
+        }
+        let mut wide = IntervalUnion::default();
+        wide.add(r(4, u64::MAX - 4));
+        wide.add(r(0, 8));
+        wide.add(r(u64::MAX - 8, u64::MAX));
+        assert_eq!(wide.covered_bytes, u64::MAX as u128);
+        assert_eq!(wide.intersections(r(0, u64::MAX)), vec![r(0, u64::MAX)]);
+        wide.add(r(1, u64::MAX - 1));
+        assert_eq!(wide.covered_bytes, u64::MAX as u128);
+        wide.subtract(r(1, u64::MAX - 1));
+        assert_eq!(wide.covered_bytes, 2);
+        wide.add(r(0, u64::MAX));
+        assert_eq!(wide.covered_bytes, u64::MAX as u128);
+        assert_eq!(wide.intersections(r(0, u64::MAX)), vec![r(0, u64::MAX)]);
+    }
+
+    #[test]
+    fn normalized_mask_bounds_match_full_union_operations() {
+        // Exhaust every coverage/mask combination over a small domain, then
+        // translate it to the largest offsets. The oracle visits every mask;
+        // it does not use envelope endpoints or the seek operation.
+        for base in [0, u64::MAX - 6] {
+            for coverage_bits in 0u64..64 {
+                let mut union = IntervalUnion::default();
+                for bit in 0..6 {
+                    if coverage_bits & (1 << bit) != 0 {
+                        union.add(r(base + bit, base + bit + 1));
+                    }
+                }
+                for ack_bits in 0u64..64 {
+                    let bytes = (0..6)
+                        .filter(|bit| ack_bits & (1 << bit) != 0)
+                        .map(|bit| base + bit)
+                        .collect::<BTreeSet<_>>();
+                    let masks = byte_set_ranges(&bytes);
+                    let selected = &masks[union.relevant_mask_indices(&masks)];
+                    let intersections = |masks: &[OffsetRange]| {
+                        masks
+                            .iter()
+                            .flat_map(|&mask| union.intersections(mask))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(intersections(selected), intersections(&masks));
+                    assert_eq!(
+                        union.subset_of_ranges(selected),
+                        union.subset_of_ranges(&masks)
+                    );
+                    let mut sought = union.clone();
+                    for &mask in selected {
+                        sought.subtract(mask);
+                    }
+                    let mut full = union.clone();
+                    for &mask in &masks {
+                        full.subtract(mask);
+                    }
+                    assert_eq!(sought.ranges, full.ranges);
+                    assert_eq!(sought.covered_bytes, full.covered_bytes);
+                }
+            }
+        }
     }
 
     #[test]
@@ -789,6 +976,133 @@ mod tests {
             ]
         );
         assert_eq!(index.assert_valid(), 10_002);
+    }
+
+    #[test]
+    fn normalized_sparse_masks_match_full_scan_and_keep_long_crossing_flights() {
+        let masks = (0..256)
+            .map(|index| r(index * 40, index * 40 + 1))
+            .collect::<Vec<_>>();
+        let sparse_flights = [
+            (
+                FlightIndexKey {
+                    start: 10_000,
+                    order: 0,
+                },
+                10_002,
+            ),
+            (
+                FlightIndexKey {
+                    start: 10_000,
+                    order: 1,
+                },
+                10_001,
+            ),
+            (
+                FlightIndexKey {
+                    start: 10_200,
+                    order: 0,
+                },
+                10_202,
+            ),
+        ];
+        let mut sparse = ProductFlightIndex::default();
+        for (key, end) in sparse_flights {
+            sparse.publish(key, end);
+        }
+
+        let expected_keys = sparse_flights
+            .iter()
+            .filter_map(|&(key, end)| {
+                masks
+                    .iter()
+                    .any(|mask| key.start < mask.end && end > mask.start)
+                    .then_some(key)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sparse.intersecting(&masks).as_slice(), expected_keys);
+        let ProductFlightIndexState::Indexed(sparse_indexed) = &sparse.state else {
+            panic!("three published flights must use the indexed state")
+        };
+        let expected_ambiguity = masks
+            .iter()
+            .flat_map(|&mask| sparse_indexed.ambiguous.intersections(mask))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sparse.ambiguous_intersections_for_ack(&masks),
+            expected_ambiguity
+        );
+        assert_eq!(
+            sparse.ack_covers_all(&masks),
+            sparse_indexed.covered.subset_of_ranges(&masks)
+        );
+
+        // Compare the bounded implementation with the former full mask walk
+        // after a partial ACK, including both union bytes and ambiguity.
+        let mut optimized = sparse.clone();
+        optimized.acknowledge(&masks);
+        let mut full_scan = sparse.clone();
+        let ProductFlightIndexState::Indexed(full_scan_indexed) = &mut full_scan.state else {
+            unreachable!("clone preserves the indexed state")
+        };
+        for &mask in &masks {
+            full_scan_indexed.covered.subtract(mask);
+            full_scan_indexed.ambiguous.subtract(mask);
+        }
+        assert_eq!(
+            optimized.covered_intersections(r(0, 20_300)),
+            full_scan.covered_intersections(r(0, 20_300))
+        );
+        assert_eq!(
+            optimized.ambiguous_intersections(r(0, 20_300)),
+            full_scan.ambiguous_intersections(r(0, 20_300))
+        );
+
+        // A crossing flight widens U's envelope back to zero, so masks at its
+        // beginning still find it even though most other retained flights are
+        // near the late end of the ACK list.
+        let crossing_flights = [
+            (FlightIndexKey { start: 0, order: 0 }, 10_002),
+            (
+                FlightIndexKey {
+                    start: 10_000,
+                    order: 0,
+                },
+                10_002,
+            ),
+        ];
+        let mut crossing = ProductFlightIndex::default();
+        for (key, end) in crossing_flights {
+            crossing.publish(key, end);
+        }
+        let ProductFlightIndexState::Indexed(crossing_indexed) = &crossing.state else {
+            unreachable!("two published flights must use the indexed state")
+        };
+        assert_eq!(
+            crossing_indexed.covered.relevant_mask_indices(&masks).start,
+            0
+        );
+        let expected_crossing_keys = crossing_flights
+            .iter()
+            .filter_map(|&(key, end)| {
+                masks
+                    .iter()
+                    .any(|mask| key.start < mask.end && end > mask.start)
+                    .then_some(key)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            crossing.intersecting(&masks).as_slice(),
+            expected_crossing_keys
+        );
+        let expected_crossing_ambiguity = masks
+            .iter()
+            .flat_map(|&mask| crossing_indexed.ambiguous.intersections(mask))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            crossing.ambiguous_intersections_for_ack(&masks),
+            expected_crossing_ambiguity
+        );
     }
 
     #[test]

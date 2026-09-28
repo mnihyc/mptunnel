@@ -446,6 +446,11 @@ fn product_flight_indexed_lifecycle_cost_and_memory() {
     for (name, count, copies, crossing, runs, full) in scenarios {
         let now = Instant::now();
         let records = lifecycle_records(count, copies, crossing, now);
+        let avl_node_struct_bytes = if records.len() < 2 {
+            0
+        } else {
+            records.len().saturating_mul(index_node)
+        };
         let final_end = (count as u64).saturating_mul(4).saturating_add(1);
         let ack = if full {
             range(0, final_end)
@@ -465,12 +470,12 @@ fn product_flight_indexed_lifecycle_cost_and_memory() {
                 (reference, indexed, "indexed-first")
             };
             eprintln!(
-                "lifecycle: case={name} flights={} runs={runs} order={order} reference_total_ms={:.3} indexed_total_ms={:.3} ratio={:.3} indexed_extra_node_struct_bytes={}B",
+                "lifecycle: case={name} flights={} runs={runs} order={order} reference_total_ms={:.3} indexed_total_ms={:.3} ratio={:.3} avl_node_struct_bytes={}B (struct size only; excludes allocator and union storage)",
                 records.len(),
                 reference.as_secs_f64() * 1_000.0,
                 indexed.as_secs_f64() * 1_000.0,
                 indexed.as_secs_f64() / reference.as_secs_f64(),
-                records.len().saturating_mul(index_node),
+                avl_node_struct_bytes,
             );
         }
     }
@@ -1562,6 +1567,170 @@ fn committed_recovery_copy_releases_publication_at_detach_start() {
         Vec::<OffsetRange>::new(),
         "physical settlement cannot revoke the successor's current publication",
     );
+}
+
+#[test]
+fn retired_slot_generations_retain_physical_attempts_until_stream_ack() {
+    const ROTATIONS: usize = 6;
+    let (binding, owner, _owner_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let copy = key(UnderlayProtocol::Tcp, 5);
+    let survivor = key(UnderlayProtocol::Tcp, 6);
+    let stable_slot = ConfiguredMemberSlot(5);
+    let (survivor_commands, _survivor_receivers) = reliable_path_command_channels(8);
+    binding.attach(
+        survivor.underlay,
+        survivor.path_id,
+        survivor_commands,
+        TrafficClass::Throughput,
+    );
+
+    let frame = stream_data_frame_at(0, 4096);
+    binding.record_original_flight(owner, &frame);
+    let owner_identity = server_output_identity(&binding, owner);
+    let owner_path_instance_id = binding
+        .outputs
+        .lock()
+        .expect("response outputs")
+        .entries
+        .iter()
+        .find(|entry| entry.key == owner)
+        .expect("original owner output")
+        .path_instance_id;
+    let owner_incarnation = match binding
+        .begin_path_detach(owner, owner_path_instance_id)
+        .expect("begin failed original detach")
+    {
+        super::super::ResponsePathDetachOutcome::Begun(incarnation)
+        | super::super::ResponsePathDetachOutcome::Pending(incarnation) => incarnation,
+    };
+    assert_eq!(owner_incarnation, owner_identity.incarnation);
+    binding.complete_path_detach(owner, owner_path_instance_id, owner_incarnation);
+    assert_eq!(
+        binding.uncovered_failed_original_ranges(),
+        vec![range(0, 4096)],
+        "the same assigned Product range remains eligible for successor recovery"
+    );
+
+    let mut accepted_incarnations = Vec::with_capacity(ROTATIONS);
+    for _ in 0..ROTATIONS {
+        let (commands, mut receivers) = reliable_path_command_channels(8);
+        let path_instance_id = next_server_carrier_path_instance_id();
+        assert_eq!(
+            binding.attach_output(ResponseOutputAttachment {
+                key: copy,
+                path_instance_id,
+                configured_slot: stable_slot,
+                local_policy: PathPolicy::default(),
+                startup_rate_prior: RateHint::Unknown,
+                commands,
+                state: ResponseOutputAttachmentState::default(),
+            }),
+            super::super::ResponseStreamAttachOutcome::Attached,
+        );
+        let identity = server_output_identity(&binding, copy);
+        accepted_incarnations.push(identity.incarnation);
+        assert_eq!(
+            binding.accepted_reinjected_data_in_flight_bytes_at(identity),
+            0,
+            "retired generations are not charged to a fresh current slot incarnation"
+        );
+        let target: ResponseDispatchTarget = binding
+            .sender_path_targets(TrafficClass::Throughput, 4096)
+            .into_iter()
+            .find(|target| target.observation.key == copy)
+            .expect("fresh same-slot recovery target")
+            .into();
+        binding
+            .try_enqueue_reinjected_frame_for_target(
+                &target,
+                &frame,
+                TrafficClass::Throughput,
+                0,
+                4096,
+                None,
+            )
+            .expect("fresh incarnation accepts the unchanged retained range");
+        assert!(try_recv_reliable_path_command(&mut receivers).is_some());
+        assert_eq!(
+            binding.accepted_reinjected_data_in_flight_bytes_at(identity),
+            4096,
+            "one active incarnation owns the current slot debt"
+        );
+
+        {
+            let flights = binding.flights.lock().expect("response flights");
+            let records = flights
+                .get(&0)
+                .expect("original range and accepted copies")
+                .iter()
+                .filter(|flight| flight.kind == CarrierWorkKind::ReinjectedData)
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), accepted_incarnations.len());
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|flight| flight.output_incarnation)
+                    .collect::<Vec<_>>(),
+                accepted_incarnations,
+                "each physical copy keeps its exact incarnation identity"
+            );
+            assert!(records.iter().all(|flight| {
+                flight.configured_slot == Some(stable_slot)
+                    && flight.assignment_range == range(0, 4096)
+                    && flight.bytes == 4096
+            }));
+            let geometry = flights.retained_geometry_for_test();
+            assert!(
+                geometry
+                    .iter()
+                    .all(|(start, end, _, _)| (*start, *end) == (0, 4096))
+            );
+            assert_eq!(geometry.len(), 1 + accepted_incarnations.len());
+            assert_eq!(flights.overlap.flight_count(), geometry.len());
+        }
+
+        let path_instance_id = binding
+            .outputs
+            .lock()
+            .expect("response outputs")
+            .entries
+            .iter()
+            .find(|entry| entry.key == copy && entry.incarnation == identity.incarnation)
+            .expect("current copy incarnation")
+            .path_instance_id;
+        let incarnation = match binding
+            .begin_path_detach(copy, path_instance_id)
+            .expect("begin exact copy detach")
+        {
+            super::super::ResponsePathDetachOutcome::Begun(incarnation)
+            | super::super::ResponsePathDetachOutcome::Pending(incarnation) => incarnation,
+        };
+        binding.complete_path_detach(copy, path_instance_id, incarnation);
+        assert_eq!(
+            binding.accepted_reinjected_data_in_flight_bytes_at(identity),
+            0,
+            "detachment reopens current slot admission while preserving Product ownership"
+        );
+        assert_eq!(
+            binding.uncovered_failed_original_ranges(),
+            vec![range(0, 4096)],
+            "retired copies are no longer current suppression owners"
+        );
+    }
+
+    assert_eq!(
+        accepted_incarnations
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        ROTATIONS,
+        "each successful reattachment has a distinct output incarnation"
+    );
+    binding.release_normalized_acked_ranges(&[range(0, 4096)]);
+    let flights = binding.flights.lock().expect("response flights");
+    assert!(flights.retained_geometry_for_test().is_empty());
+    assert_eq!(flights.overlap.flight_count(), 0);
 }
 
 #[test]

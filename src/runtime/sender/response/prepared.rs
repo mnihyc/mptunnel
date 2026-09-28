@@ -348,18 +348,36 @@ pub(in crate::runtime) fn claim_prepared_response_data(
     if let Err(error) = commitments.check_selected(identity) {
         return PreparedOriginalClaim::CarrierFailed(RuntimeError::from(error));
     }
-    let Some(observation) = owner
-        .binding()
-        .observe_prepared_original(&inputs, lane, offset)
-    else {
-        return PreparedOriginalClaim::Blocked(wake);
+    let original_observation = if source.is_some() {
+        let Some(observation) = owner
+            .binding()
+            .observe_prepared_original(&inputs, lane, offset)
+        else {
+            return PreparedOriginalClaim::Blocked(wake);
+        };
+        Some(observation)
+    } else {
+        None
+    };
+    let recovery_targets = if original_observation.is_none() {
+        let Some(targets) = owner.binding().observe_prepared_recovery(&inputs, lane) else {
+            return PreparedOriginalClaim::Blocked(wake);
+        };
+        Some(targets)
+    } else {
+        None
+    };
+    let targets = match (&original_observation, &recovery_targets) {
+        (Some(observation), _) => observation.debt_projection.targets(),
+        (_, Some(targets)) => targets.as_slice(),
+        (None, None) => return PreparedOriginalClaim::Blocked(wake),
     };
     let recovery = state.sender.next_prepared_recovery(
         owner.binding(),
         &state.send_stream,
         &state.last_send_ack,
         lane,
-        observation.debt_projection.targets(),
+        targets,
         &ready_outputs(&outputs),
         Instant::now(),
     );
@@ -405,11 +423,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
             if let Some(shape) = shape {
                 inputs.replace_fenced_target(identity, shape);
             }
-            let observation = owner.binding().observe_prepared_original(
-                &inputs,
-                lane,
-                state.send_stream.next_offset(),
-            )?;
+            let observation = owner.binding().observe_prepared_recovery(&inputs, lane)?;
             let current = state
                 .sender
                 .next_prepared_recovery(
@@ -417,7 +431,7 @@ pub(in crate::runtime) fn claim_prepared_response_data(
                     &state.send_stream,
                     &state.last_send_ack,
                     lane,
-                    observation.debt_projection.targets(),
+                    &observation,
                     &ready_outputs(&outputs),
                     Instant::now(),
                 )
@@ -505,6 +519,9 @@ pub(in crate::runtime) fn claim_prepared_response_data(
         } else {
             PreparedOriginalClaim::Blocked(wake)
         };
+    };
+    let Some(observation) = original_observation else {
+        return PreparedOriginalClaim::Blocked(wake);
     };
     if state.send_stream.next_offset() != offset
         || !source_prefix(&state).is_some_and(|current| {

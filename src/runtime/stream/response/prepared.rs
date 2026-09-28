@@ -4,7 +4,7 @@ use super::snapshot::{
     server_bulk_output_snapshot_at, server_native_bulk_output_snapshot_at,
     server_sender_path_target_at,
 };
-use super::{ResponseAcquisitionOutputId, ResponseStreamBinding};
+use super::{ResponseAcquisitionOutputId, ResponseStreamBinding, ResponseStreamOutputs};
 use crate::model::carrier_rate_authority::CarrierRateAuthorityScope;
 use crate::protocol::{PathMetricDirection, UnderlayProtocol};
 use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
@@ -102,6 +102,41 @@ impl ResponseStreamBinding {
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
+        let targets = self.prepared_targets_locked(&outputs, inputs, lane)?;
+        let debt_projection = self.project_lower_debt_before_offset(next_offset, targets);
+        Some(ResponsePreparedObservation {
+            debt_projection,
+            // Keep this load after projection and under the same outputs lock:
+            // existing generation publication order is part of the commit fence.
+            model_generation: self.response_model_generation.load(Ordering::Acquire),
+        })
+    }
+
+    /// Capture the exact same targets used by Original selection, without
+    /// scanning lower flights and ACK holes. Recovery discovery consumes only
+    /// targets; its accepted commit independently revalidates authority.
+    pub(in crate::runtime) fn observe_prepared_recovery(
+        &self,
+        inputs: &ResponsePreparedNativeInputs,
+        lane: TrafficClass,
+    ) -> Option<Vec<super::ResponseSenderPathTarget>> {
+        let outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let targets = self.prepared_targets_locked(&outputs, inputs, lane)?;
+        Some(targets)
+    }
+
+    /// Shared exact-membership and target snapshot path. Callers retain the
+    /// outputs guard: Original observation projects debt before releasing it,
+    /// while recovery observation returns the same target values directly.
+    fn prepared_targets_locked(
+        &self,
+        outputs: &ResponseStreamOutputs,
+        inputs: &ResponsePreparedNativeInputs,
+        lane: TrafficClass,
+    ) -> Option<Vec<super::ResponseSenderPathTarget>> {
         if !self.response_stream_open.load(Ordering::Acquire)
             || outputs.entries.len() != inputs.outputs.len()
             || !outputs
@@ -119,7 +154,7 @@ impl ResponseStreamBinding {
             .lock()
             .expect("server response ingress lock");
         let now = Instant::now();
-        let targets: Vec<_> = outputs
+        let targets = outputs
             .entries
             .iter()
             .zip(&inputs.outputs)
@@ -158,11 +193,7 @@ impl ResponseStreamBinding {
                 target
             })
             .collect();
-        let debt_projection = self.project_lower_debt_before_offset(next_offset, targets);
-        Some(ResponsePreparedObservation {
-            debt_projection,
-            model_generation: self.response_model_generation.load(Ordering::Acquire),
-        })
+        Some(targets)
     }
 }
 
@@ -181,6 +212,41 @@ mod tests {
     use bytes::Bytes;
     use futures::FutureExt;
     use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    #[test]
+    fn prepared_recovery_observation_does_not_read_lower_flight_ledger() {
+        let fixture = native_response_binding_fixture(8, Some(100_000_000));
+        let outputs = fixture.binding.prepared_outputs();
+        let inputs = ResponsePreparedNativeInputs::resolve(outputs);
+        let worker_binding = fixture.binding.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let flight_binding = fixture.binding.clone();
+        let flights = flight_binding.flights.lock().expect("response flights");
+        let worker = std::thread::spawn(move || {
+            let observed = worker_binding
+                .observe_prepared_recovery(&inputs, TrafficClass::Throughput)
+                .map(|targets| targets.len());
+            send.send(observed).expect("test receiver remains live");
+        });
+
+        let while_flights_locked = receive.recv_timeout(Duration::from_secs(1));
+        let completed_while_locked = while_flights_locked.is_ok();
+        drop(flights);
+        let after_unlock = match while_flights_locked {
+            Ok(observed) => observed,
+            Err(_) => receive
+                .recv_timeout(Duration::from_secs(1))
+                .expect("recovery observation finishes after releasing flights"),
+        };
+        worker.join().expect("recovery observation worker exits");
+
+        assert!(
+            completed_while_locked,
+            "target-only recovery observation must not wait for lower-debt projection locks"
+        );
+        assert_eq!(after_unlock, Some(1));
+    }
 
     #[tokio::test]
     async fn prepared_response_native_claim_converts_source_without_queue_publication() {

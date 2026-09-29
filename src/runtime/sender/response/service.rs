@@ -288,7 +288,9 @@ impl ServerResponseSenderService {
         ready: &[ResponseAcquisitionOutputId],
         observed_at: Instant,
     ) -> ResponsePreparedRecoveryObservation {
-        let (covered, mut next_deadline) = binding.prepared_recovery_coverage(observed_at);
+        let copy_work = binding.observe_prepared_copy_work(observed_at);
+        let covered = &copy_work.covered;
+        let mut next_deadline = copy_work.next_deadline;
         // Both the exceptional frontier attempt and the ordinary fallback are
         // one discovery observation. Reuse one coherent slot-debt snapshot if
         // the first range falls through; final admission still revalidates it.
@@ -307,6 +309,7 @@ impl ServerResponseSenderService {
         {
             let exceptional = self.prepared_recovery_for_range(
                 binding,
+                &copy_work,
                 send_stream,
                 authoritative_ack,
                 lane,
@@ -323,7 +326,7 @@ impl ServerResponseSenderService {
             }
             next_deadline = exceptional.next_deadline;
         }
-        let Some(range) = offset_ranges_not_covered(&retained, &covered)
+        let Some(range) = offset_ranges_not_covered(&retained, covered)
             .first()
             .copied()
         else {
@@ -334,6 +337,7 @@ impl ServerResponseSenderService {
         };
         self.prepared_recovery_for_range(
             binding,
+            &copy_work,
             send_stream,
             authoritative_ack,
             lane,
@@ -351,6 +355,7 @@ impl ServerResponseSenderService {
     fn prepared_recovery_for_range(
         &self,
         binding: &ResponseStreamBinding,
+        copy_work: &crate::runtime::stream::response::ResponsePreparedCopyObservation<'_>,
         send_stream: &ReliableSendStream,
         authoritative_ack: &AuthoritativeStreamAckSnapshot,
         lane: TrafficClass,
@@ -468,8 +473,7 @@ impl ServerResponseSenderService {
                         incarnation: target.observation.incarnation,
                     })
                     .collect::<SmallVec<[_; 4]>>();
-                let ready_debts = binding
-                    .accepted_reinjected_data_in_flight_bytes_for_outputs_at(&ready_identities);
+                let ready_debts = copy_work.accepted_debts(&ready_identities);
                 let mut debts = SmallVec::<[usize; 4]>::new();
                 debts.resize(targets.len(), 0);
                 for ((index, _), debt) in targets

@@ -87,6 +87,144 @@ struct ReinjectedSlotDebtObservation {
     bytes: usize,
 }
 
+/// One query-local view. Suppression coverage is time-dependent; configured
+/// slot debt is accepted ownership and includes expired copies. They are
+/// deliberately separate products of the same locked flight traversal.
+pub(in crate::runtime) struct ResponsePreparedCopyObservation<'binding> {
+    binding: &'binding ResponseStreamBinding,
+    model_generation: u64,
+    pub(in crate::runtime) covered: Vec<OffsetRange>,
+    pub(in crate::runtime) next_deadline: Option<Instant>,
+    // The inline path covers the established one-to-four-member common case.
+    // Wider memberships retain the existing batched debt query, not a cap.
+    debt: Option<PreparedCopyDebtView>,
+}
+
+struct PreparedCopyDebtDomain {
+    underlay: UnderlayProtocol,
+    configured_slot: ConfiguredMemberSlot,
+    pending: Option<(u64, u64)>,
+    bytes: usize,
+}
+
+impl PreparedCopyDebtDomain {
+    fn add_ordered(&mut self, start: u64, end: u64) {
+        if end <= start {
+            return;
+        }
+        match self.pending {
+            Some((left, right)) if right >= start => {
+                self.pending = Some((left, right.max(end)));
+            }
+            Some((left, right)) => {
+                self.bytes = self
+                    .bytes
+                    .saturating_add(flight_interval_bytes(left, right));
+                self.pending = Some((start, end));
+            }
+            None => self.pending = Some((start, end)),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.pending.map_or(self.bytes, |(start, end)| {
+            self.bytes.saturating_add(flight_interval_bytes(start, end))
+        })
+    }
+}
+
+struct PreparedCopyDebtView {
+    members: SmallVec<[(ServerReinjectionOutputIdentity, usize); 4]>,
+    domains: SmallVec<[PreparedCopyDebtDomain; 4]>,
+}
+
+impl PreparedCopyDebtView {
+    fn from_outputs(outputs: &ResponseStreamOutputs) -> Option<Self> {
+        if outputs.entries.len() > 4 {
+            return None;
+        }
+        let mut result = Self {
+            members: SmallVec::new(),
+            domains: SmallVec::new(),
+        };
+        for entry in &outputs.entries {
+            let domain = result
+                .domains
+                .iter()
+                .position(|domain| {
+                    domain.underlay == entry.key.underlay
+                        && domain.configured_slot == entry.configured_slot
+                })
+                .unwrap_or_else(|| {
+                    let index = result.domains.len();
+                    result.domains.push(PreparedCopyDebtDomain {
+                        underlay: entry.key.underlay,
+                        configured_slot: entry.configured_slot,
+                        pending: None,
+                        bytes: 0,
+                    });
+                    index
+                });
+            result.members.push((
+                ServerReinjectionOutputIdentity {
+                    key: entry.key,
+                    incarnation: entry.incarnation,
+                },
+                domain,
+            ));
+        }
+        Some(result)
+    }
+}
+
+impl ResponsePreparedCopyObservation<'_> {
+    /// Advisory reuse only. The final accepted publication still executes its
+    /// existing admission and exact-owner checks. Structural changes invalidate
+    /// this view; deadline expiry alone never cancels accepted-copy debt.
+    pub(in crate::runtime) fn accepted_debts(
+        &self,
+        identities: &[ServerReinjectionOutputIdentity],
+    ) -> SmallVec<[usize; 4]> {
+        if identities.is_empty() {
+            return SmallVec::new();
+        }
+        if let Some(view) = &self.debt {
+            let outputs = self
+                .binding
+                .outputs
+                .lock()
+                .expect("server reliable stream binding lock");
+            if self
+                .binding
+                .response_model_generation
+                .load(Ordering::Acquire)
+                == self.model_generation
+                && !self.binding.flights.is_poisoned()
+            {
+                // Both the member set and the byte union are fenced by this
+                // generation under outputs. Readiness/native metrics are not.
+                let answer = identities
+                    .iter()
+                    .map(|identity| {
+                        view.members
+                            .iter()
+                            .find(|(member, _)| {
+                                member.key == identity.key
+                                    && member.incarnation == identity.incarnation
+                            })
+                            .map_or(0, |(_, index)| view.domains[*index].bytes())
+                    })
+                    .collect();
+                drop(outputs);
+                return answer;
+            }
+        }
+        // This also preserves the original poisoned-lock/error path.
+        self.binding
+            .accepted_reinjected_data_in_flight_bytes_for_outputs_at(identities)
+    }
+}
+
 /// Raw copy debt is lifetime evidence, independent of current path membership
 /// and suppression clocks. Do not skip a spent head to race a later suffix.
 fn uncopied_completion_prefix(
@@ -2594,10 +2732,21 @@ impl ResponseStreamBinding {
 
     /// One accepted-service observation. Expiry restores reconsideration but
     /// does not remove any flight or free a configured copy slot.
+    #[cfg(test)]
     pub(in crate::runtime) fn prepared_recovery_coverage(
         &self,
         observed_at: Instant,
     ) -> (Vec<OffsetRange>, Option<Instant>) {
+        let observation = self.observe_prepared_copy_work(observed_at);
+        (observation.covered, observation.next_deadline)
+    }
+
+    /// Join the two readers at their common authoritative lock boundary.
+    /// Time-dependent suppression is recomputed on every invocation.
+    pub(in crate::runtime) fn observe_prepared_copy_work(
+        &self,
+        observed_at: Instant,
+    ) -> ResponsePreparedCopyObservation<'_> {
         let outputs = self
             .outputs
             .lock()
@@ -2606,16 +2755,28 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
+        let mut debt = PreparedCopyDebtView::from_outputs(&outputs);
         let mut covered = Vec::new();
         let mut next_deadline = None::<Instant>;
         for (&start, entries) in flights.iter() {
             for flight in entries {
-                if flight.kind != CarrierWorkKind::ReinjectedData
-                    || !outputs.entries.iter().any(|entry| {
+                if flight.kind != CarrierWorkKind::ReinjectedData {
+                    continue;
+                }
+                let Some((member_index, entry)) =
+                    outputs.entries.iter().enumerate().find(|(_, entry)| {
                         entry.key == flight.key && entry.incarnation == flight.output_incarnation
                     })
-                {
+                else {
                     continue;
+                };
+                // Do this BEFORE the deadline check. Accepted debt outlives
+                // suppression and does not transfer to a successor incarnation.
+                if let Some(view) = &mut debt
+                    && flight.configured_slot == Some(entry.configured_slot)
+                {
+                    let domain = view.members[member_index].1;
+                    view.domains[domain].add_ordered(start, flight.end);
                 }
                 let Some(deadline) = flight
                     .reinjection_suppression_deadline
@@ -2631,7 +2792,13 @@ impl ResponseStreamBinding {
                     Some(next_deadline.map_or(deadline, |current| current.min(deadline)));
             }
         }
-        (normalize_offset_ranges(covered), next_deadline)
+        ResponsePreparedCopyObservation {
+            binding: self,
+            model_generation: self.response_model_generation.load(Ordering::Acquire),
+            covered: normalize_offset_ranges(covered),
+            next_deadline,
+            debt,
+        }
     }
 
     /// Preserve each assignment's first observed clocks, including all ACK

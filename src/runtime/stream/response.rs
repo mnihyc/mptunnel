@@ -42,6 +42,7 @@ pub(in crate::runtime::stream) use delivery::ResponseProductFlightLedger;
 pub(super) use delivery::{CarrierPathFlight, product_flights_have_recent_reinjection_overlap};
 pub(in crate::runtime) use delivery::{
     ResponseCreditFrontierProof, ResponseDataAckRecoveryCandidate, ResponseDataAckRelease,
+    ResponsePreparedCopyObservation,
 };
 pub(in crate::runtime) use diagnostics::record_server_sender_decision;
 pub(in crate::runtime) use evidence::{ServerPathMetricsEntry, ServerPathMetricsSource};

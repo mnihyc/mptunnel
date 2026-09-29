@@ -64,7 +64,10 @@ impl ResponsePreparedNativeInputs {
     }
 }
 
-pub(in crate::runtime) struct ResponsePreparedObservation {
+pub(in crate::runtime) struct ResponsePreparedObservation<'binding> {
+    // Borrowing the owner bounds reuse to its lifetime; no raw-address cache.
+    binding: &'binding ResponseStreamBinding,
+    next_offset: u64,
     pub(in crate::runtime) debt_projection: super::ResponseDebtProjection,
     pub(in crate::runtime) model_generation: u64,
 }
@@ -97,17 +100,62 @@ impl ResponseStreamBinding {
         inputs: &ResponsePreparedNativeInputs,
         lane: TrafficClass,
         next_offset: u64,
-    ) -> Option<ResponsePreparedObservation> {
+    ) -> Option<ResponsePreparedObservation<'_>> {
+        self.observe_prepared_original_with_prior(inputs, lane, next_offset, None)
+    }
+
+    /// The advisory and final observations belong to one synchronous claim.
+    /// Only lower-range facts may be reused. Targets are rebuilt from current
+    /// Product/path state and the supplied Native inputs; the claim refreshes
+    /// its selected Native shape under the existing final fence. Selection,
+    /// recovery priority and accepted ownership are checked again. Consuming
+    /// the prior observation transfers its numeric vector without cloning it.
+    pub(in crate::runtime) fn reobserve_prepared_original(
+        &self,
+        inputs: &ResponsePreparedNativeInputs,
+        lane: TrafficClass,
+        next_offset: u64,
+        prior: ResponsePreparedObservation<'_>,
+    ) -> Option<ResponsePreparedObservation<'_>> {
+        self.observe_prepared_original_with_prior(inputs, lane, next_offset, Some(prior))
+    }
+
+    fn observe_prepared_original_with_prior(
+        &self,
+        inputs: &ResponsePreparedNativeInputs,
+        lane: TrafficClass,
+        next_offset: u64,
+        prior: Option<ResponsePreparedObservation<'_>>,
+    ) -> Option<ResponsePreparedObservation<'_>> {
         let outputs = self
             .outputs
             .lock()
             .expect("server reliable stream binding lock");
         let targets = self.prepared_targets_locked(&outputs, inputs, lane)?;
-        let debt_projection = self.project_lower_debt_before_offset(next_offset, targets);
+        let generation = self.response_model_generation.load(Ordering::Acquire);
+        // Keep the cheap single-output path on its established computation.
+        // Changes to the ledger/hole selection publish this generation under
+        // the same outputs lock. Timing-only mutations do not alter these facts.
+        let prior = prior.filter(|prior| {
+            targets.len() >= 2
+                && std::ptr::eq(prior.binding, self)
+                && prior.next_offset == next_offset
+                && prior.model_generation == generation
+                && !self.flights.is_poisoned()
+                && !self.ack_ordering.is_poisoned()
+        });
+        let debt_projection = match prior {
+            Some(prior) => match prior.debt_projection.retarget_unchanged(targets) {
+                Ok(reused) => reused,
+                Err(targets) => self.project_lower_debt_before_offset(next_offset, targets),
+            },
+            None => self.project_lower_debt_before_offset(next_offset, targets),
+        };
         Some(ResponsePreparedObservation {
+            binding: self,
+            next_offset,
             debt_projection,
-            // Keep this load after projection and under the same outputs lock:
-            // existing generation publication order is part of the commit fence.
+            // Retain the existing post-projection generation publication order.
             model_generation: self.response_model_generation.load(Ordering::Acquire),
         })
     }
@@ -372,5 +420,634 @@ mod tests {
             Some(()),
             "unlock before first poll remains visible"
         );
+    }
+
+    fn two_tcp_output_binding() -> (
+        Arc<ResponseStreamBinding>,
+        crate::model::path::CarrierPathKey,
+        Vec<crate::runtime::path::commands::ReliablePathCommandReceivers>,
+    ) {
+        use crate::protocol::PathId;
+        use crate::runtime::path::commands::reliable_path_command_channels;
+        let (binding, key, first) =
+            super::super::test_support::binding_for_underlay(UnderlayProtocol::Tcp);
+        let (commands, second) = reliable_path_command_channels(8);
+        binding.attach(
+            UnderlayProtocol::Tcp,
+            PathId(11),
+            commands,
+            TrafficClass::Throughput,
+        );
+        (binding, key, vec![first, second])
+    }
+
+    fn assert_same_debt(a: &ResponsePreparedObservation<'_>, b: &ResponsePreparedObservation<'_>) {
+        assert_eq!(
+            a.debt_projection.oldest_owner(),
+            b.debt_projection.oldest_owner()
+        );
+        assert_eq!(
+            a.debt_projection.targets().len(),
+            b.debt_projection.targets().len()
+        );
+        for i in 0..a.debt_projection.targets().len() {
+            assert_eq!(
+                a.debt_projection.exact_other_path_debt_bytes(i),
+                b.debt_projection.exact_other_path_debt_bytes(i)
+            );
+        }
+    }
+
+    #[test]
+    fn final_original_reuses_only_fenced_lower_range_facts() {
+        let (binding, key, _receivers) = two_tcp_output_binding();
+        binding.record_original_flight(
+            key,
+            &Frame::StreamData {
+                stream_id: StreamId(42),
+                offset: 0,
+                payload: Bytes::from_static(b"abcdefgh"),
+            },
+        );
+        let inputs = ResponsePreparedNativeInputs::resolve(binding.prepared_outputs());
+        let prior = binding
+            .observe_prepared_original(&inputs, TrafficClass::Throughput, 64)
+            .unwrap();
+        let expected = binding
+            .observe_prepared_original(&inputs, TrafficClass::Throughput, 64)
+            .unwrap();
+        std::thread::scope(|scope| {
+            let flights = binding.flights.lock().expect("test flights");
+            let holes = binding.ack_ordering.lock().expect("test holes");
+            let (send, receive) = std::sync::mpsc::channel();
+            let binding = &binding;
+            let inputs = &inputs;
+            let expected = &expected;
+            let worker = scope.spawn(move || {
+                let observed = binding
+                    .reobserve_prepared_original(inputs, TrafficClass::Throughput, 64, prior)
+                    .unwrap();
+                assert_same_debt(&observed, expected);
+                send.send(()).unwrap();
+            });
+            let completed_while_locked = receive.recv_timeout(Duration::from_secs(1)).is_ok();
+            drop(holes);
+            drop(flights);
+            worker.join().unwrap();
+            assert!(
+                completed_while_locked,
+                "same-generation final observation must not rescan"
+            );
+        });
+        let prior = binding
+            .observe_prepared_original(&inputs, TrafficClass::Throughput, 64)
+            .unwrap();
+        let prior_generation = prior.model_generation;
+        binding.record_original_flight(
+            key,
+            &Frame::StreamData {
+                stream_id: StreamId(42),
+                offset: 16,
+                payload: Bytes::from_static(b"ijkl"),
+            },
+        );
+        let after = binding
+            .reobserve_prepared_original(&inputs, TrafficClass::Throughput, 64, prior)
+            .unwrap();
+        let fresh = binding
+            .observe_prepared_original(&inputs, TrafficClass::Throughput, 64)
+            .unwrap();
+        assert_same_debt(&after, &fresh);
+        assert_ne!(after.model_generation, prior_generation);
+        let prefix = binding
+            .reobserve_prepared_original(&inputs, TrafficClass::Throughput, 4, after)
+            .unwrap();
+        assert_same_debt(
+            &prefix,
+            &binding
+                .observe_prepared_original(&inputs, TrafficClass::Throughput, 4)
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn receipt_from_another_binding_misses_even_at_the_current_generation() {
+        let (foreign_binding, _, _foreign_receivers) = two_tcp_output_binding();
+        let (binding, key, _receivers) = two_tcp_output_binding();
+        let inputs = ResponsePreparedNativeInputs::resolve(binding.prepared_outputs());
+        let stale = binding
+            .observe_prepared_original(&inputs, TrafficClass::Throughput, 64)
+            .unwrap();
+
+        binding.record_original_flight(
+            key,
+            &Frame::StreamData {
+                stream_id: StreamId(42),
+                offset: 0,
+                payload: Bytes::from_static(b"abcdefgh"),
+            },
+        );
+        // Deliberately set the receipt generation to the target binding's current
+        // generation. This isolates the binding-pointer fence from generation,
+        // offset, and ordered-identity fences.
+        let foreign_receipt = ResponsePreparedObservation {
+            binding: foreign_binding.as_ref(),
+            next_offset: 64,
+            debt_projection: stale.debt_projection,
+            model_generation: binding.response_model_generation(),
+        };
+
+        let observed = binding
+            .reobserve_prepared_original(&inputs, TrafficClass::Throughput, 64, foreign_receipt)
+            .unwrap();
+        let reference = binding
+            .observe_prepared_original(&inputs, TrafficClass::Throughput, 64)
+            .unwrap();
+        assert_same_debt(&observed, &reference);
+        let oldest = observed.debt_projection.oldest_owner();
+        assert!(oldest.is_some());
+        assert_eq!(oldest.map(|(owner, _)| owner), Some(key));
+    }
+
+    #[test]
+    fn original_receipt_misses_after_ack_releases_lower_geometry() {
+        let (binding, key, _receivers) = two_tcp_output_binding();
+        binding.record_original_flight(
+            key,
+            &Frame::StreamData {
+                stream_id: StreamId(42),
+                offset: 0,
+                payload: Bytes::from_static(b"abcdefgh"),
+            },
+        );
+        let inputs = ResponsePreparedNativeInputs::resolve(binding.prepared_outputs());
+        let prior = binding
+            .observe_prepared_original(&inputs, TrafficClass::Throughput, 64)
+            .unwrap();
+        let prior_generation = prior.model_generation;
+        assert!(prior.debt_projection.oldest_owner().is_some());
+
+        binding.release_normalized_acked_ranges(&[
+            crate::protocol::OffsetRange::new(0, 8).expect("valid ACK range")
+        ]);
+        assert_ne!(binding.response_model_generation(), prior_generation);
+
+        let observed = binding
+            .reobserve_prepared_original(&inputs, TrafficClass::Throughput, 64, prior)
+            .unwrap();
+        let reference = binding
+            .observe_prepared_original(&inputs, TrafficClass::Throughput, 64)
+            .unwrap();
+        assert_same_debt(&observed, &reference);
+        assert_eq!(observed.debt_projection.oldest_owner(), None);
+    }
+
+    #[test]
+    fn original_receipt_misses_after_attachment_membership_changes() {
+        let (binding, _, _receivers) = two_tcp_output_binding();
+        let old_inputs = ResponsePreparedNativeInputs::resolve(binding.prepared_outputs());
+        let prior = binding
+            .observe_prepared_original(&old_inputs, TrafficClass::Throughput, 64)
+            .unwrap();
+        let prior_generation = prior.model_generation;
+
+        let (commands, _new_receivers) =
+            crate::runtime::path::commands::reliable_path_command_channels(8);
+        assert_eq!(
+            binding.attach(
+                UnderlayProtocol::Tcp,
+                crate::protocol::PathId(12),
+                commands,
+                TrafficClass::Throughput,
+            ),
+            super::super::ResponseStreamAttachOutcome::Attached,
+        );
+        assert_ne!(binding.response_model_generation(), prior_generation);
+
+        // The prior native inputs no longer describe full membership. Capture the
+        // current exact set, then verify the old receipt falls back for its changed
+        // generation and target count.
+        let current_inputs = ResponsePreparedNativeInputs::resolve(binding.prepared_outputs());
+        let observed = binding
+            .reobserve_prepared_original(&current_inputs, TrafficClass::Throughput, 64, prior)
+            .unwrap();
+        let reference = binding
+            .observe_prepared_original(&current_inputs, TrafficClass::Throughput, 64)
+            .unwrap();
+        assert_same_debt(&observed, &reference);
+        assert_eq!(observed.debt_projection.targets().len(), 3);
+    }
+
+    #[test]
+    fn single_target_original_receipt_keeps_the_reference_scan() {
+        use std::sync::TryLockError;
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let (binding, key, _receivers) =
+            super::super::test_support::binding_for_underlay(UnderlayProtocol::Tcp);
+        binding.record_original_flight(
+            key,
+            &Frame::StreamData {
+                stream_id: StreamId(42),
+                offset: 0,
+                payload: Bytes::from_static(b"abcdefgh"),
+            },
+        );
+        let inputs = ResponsePreparedNativeInputs::resolve(binding.prepared_outputs());
+        let prior = binding
+            .observe_prepared_original(&inputs, TrafficClass::Throughput, 64)
+            .unwrap();
+        assert_eq!(prior.debt_projection.targets().len(), 1);
+
+        std::thread::scope(|scope| {
+            let flights = binding.flights.lock().expect("test flights");
+            let (started_send, started_receive) = mpsc::channel();
+            let (done_send, done_receive) = mpsc::channel();
+            let worker_binding = &binding;
+            let worker = scope.spawn(move || {
+                started_send.send(()).unwrap();
+                let observed = worker_binding
+                    .reobserve_prepared_original(&inputs, TrafficClass::Throughput, 64, prior)
+                    .unwrap();
+                done_send
+                    .send(original_observation_checksum(&observed))
+                    .unwrap();
+            });
+            started_receive.recv().expect("worker started");
+
+            // Wait until the worker owns outputs and therefore has reached the
+            // reference projection's blocked flight-lock acquisition.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match binding.outputs.try_lock() {
+                    Ok(outputs) => drop(outputs),
+                    Err(TryLockError::WouldBlock) => break,
+                    Err(TryLockError::Poisoned(_)) => panic!("outputs lock poisoned"),
+                }
+                assert!(Instant::now() < deadline, "worker did not acquire outputs");
+                std::thread::yield_now();
+            }
+            let completed_while_flights_locked =
+                done_receive.recv_timeout(Duration::from_millis(30)).is_ok();
+            drop(flights);
+            let observed_checksum = done_receive
+                .recv_timeout(Duration::from_secs(1))
+                .expect("reference scan finishes after flights unlock");
+            worker.join().expect("worker exits");
+            assert!(
+                !completed_while_flights_locked,
+                "one target must keep the established lower-flight scan",
+            );
+            let reference = binding
+                .observe_prepared_original(
+                    &ResponsePreparedNativeInputs::resolve(binding.prepared_outputs()),
+                    TrafficClass::Throughput,
+                    64,
+                )
+                .unwrap();
+            assert_eq!(
+                observed_checksum,
+                original_observation_checksum(&reference),
+                "the single-target reference result still includes the retained owner",
+            );
+        });
+    }
+
+    #[test]
+    fn original_receipt_preserves_poisoned_lower_state_failure() {
+        for poison_ordering in [false, true] {
+            for reuse in [false, true] {
+                let (binding, key, _receivers) = two_tcp_output_binding();
+                binding.record_original_flight(
+                    key,
+                    &Frame::StreamData {
+                        stream_id: StreamId(42),
+                        offset: 0,
+                        payload: Bytes::from_static(b"abcdefgh"),
+                    },
+                );
+                let inputs = ResponsePreparedNativeInputs::resolve(binding.prepared_outputs());
+                let prior = binding
+                    .observe_prepared_original(&inputs, TrafficClass::Throughput, 64)
+                    .unwrap();
+                let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if poison_ordering {
+                        let _guard = binding.ack_ordering.lock().unwrap();
+                        panic!("isolated ordering poison");
+                    } else {
+                        let _guard = binding.flights.lock().unwrap();
+                        panic!("isolated flight poison");
+                    }
+                }));
+                assert!(poison.is_err());
+                let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if reuse {
+                        binding.reobserve_prepared_original(
+                            &inputs,
+                            TrafficClass::Throughput,
+                            64,
+                            prior,
+                        )
+                    } else {
+                        binding.observe_prepared_original(&inputs, TrafficClass::Throughput, 64)
+                    }
+                }));
+                assert!(
+                    observed.is_err(),
+                    "reuse must preserve the reference poison failure"
+                );
+            }
+        }
+    }
+
+    fn original_observation_fixture(
+        target_count: usize,
+        retained_originals: usize,
+    ) -> (
+        Arc<ResponseStreamBinding>,
+        Vec<crate::runtime::path::commands::ReliablePathCommandReceivers>,
+    ) {
+        assert!([1, 2, 4].contains(&target_count));
+        assert!([1, 16, 256, 4096].contains(&retained_originals));
+        let (binding, _first_key, first_receivers) =
+            super::super::test_support::binding_for_underlay(UnderlayProtocol::Tcp);
+        let mut receivers = vec![first_receivers];
+        for index in 1..target_count {
+            let path_id = crate::protocol::PathId(100 + index as u16);
+            let (commands, output_receivers) =
+                crate::runtime::path::commands::reliable_path_command_channels(8);
+            assert_eq!(
+                binding.attach(
+                    UnderlayProtocol::Tcp,
+                    path_id,
+                    commands,
+                    TrafficClass::Throughput,
+                ),
+                super::super::ResponseStreamAttachOutcome::Attached,
+            );
+            receivers.push(output_receivers);
+        }
+
+        let targets = binding.sender_path_targets(TrafficClass::Throughput, 64);
+        assert_eq!(targets.len(), target_count);
+        let now = std::time::Instant::now();
+        {
+            // Keep fixture publication in the production lock order and use the
+            // real ledger/index. Direct test publication avoids unrelated Product
+            // qualification work; timing starts only after this block.
+            let _outputs = binding.outputs.lock().expect("fixture outputs");
+            let mut flights = binding.flights.lock().expect("fixture flights");
+            for index in 0..retained_originals {
+                let target = &targets[index % target_count];
+                let start = (index as u64).saturating_mul(16);
+                let mut flight = super::super::CarrierPathFlight::fixed_output(
+                    target.observation.key,
+                    start + 8,
+                    8,
+                    now,
+                    crate::model::work::CarrierWorkKind::OriginalData,
+                    None,
+                );
+                flight.output_incarnation = target.observation.incarnation;
+                flights.publish(start, flight);
+            }
+            binding
+                .response_model_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        (binding, receivers)
+    }
+
+    fn timed_original_observation_pairs(
+        binding: &ResponseStreamBinding,
+        inputs: &ResponsePreparedNativeInputs,
+        next_offset: u64,
+        pairs: usize,
+        reuse_prior: bool,
+        invalidate_each_pair: bool,
+        queue_bytes: &mut usize,
+    ) -> (std::time::Duration, u64) {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let started = Instant::now();
+        let mut checksum = 0u64;
+        for _ in 0..pairs {
+            if reuse_prior {
+                let advisory = binding
+                    .observe_prepared_original(inputs, TrafficClass::Throughput, next_offset)
+                    .expect("fixture membership remains current");
+                let advisory_checksum = original_observation_checksum(&advisory);
+                if invalidate_each_pair {
+                    *queue_bytes = if *queue_bytes == 1 { 2 } else { 1 };
+                    binding.set_sender_queue_bytes(*queue_bytes);
+                }
+                let final_observation = binding
+                    .reobserve_prepared_original(
+                        inputs,
+                        TrafficClass::Throughput,
+                        next_offset,
+                        advisory,
+                    )
+                    .expect("final target observation remains current");
+                checksum = checksum
+                    .wrapping_add(advisory_checksum)
+                    .wrapping_add(original_observation_checksum(&final_observation));
+                black_box(checksum);
+                drop(final_observation);
+            } else {
+                let advisory = binding
+                    .observe_prepared_original(inputs, TrafficClass::Throughput, next_offset)
+                    .expect("fixture membership remains current");
+                let advisory_checksum = original_observation_checksum(&advisory);
+                if invalidate_each_pair {
+                    *queue_bytes = if *queue_bytes == 1 { 2 } else { 1 };
+                    binding.set_sender_queue_bytes(*queue_bytes);
+                }
+                let final_observation = binding
+                    .observe_prepared_original(inputs, TrafficClass::Throughput, next_offset)
+                    .expect("reference final observation remains current");
+                checksum = checksum
+                    .wrapping_add(advisory_checksum)
+                    .wrapping_add(original_observation_checksum(&final_observation));
+                black_box(checksum);
+                // Keep both observations alive through the pair, so allocation
+                // overlap and both drops are inside the measured interval.
+                drop(advisory);
+                drop(final_observation);
+            }
+        }
+        (started.elapsed(), black_box(checksum))
+    }
+
+    fn original_observation_checksum(observation: &ResponsePreparedObservation<'_>) -> u64 {
+        let mut checksum = observation.debt_projection.targets().len() as u64;
+        if let Some((_, incarnation)) = observation.debt_projection.oldest_owner() {
+            checksum = checksum.wrapping_add(incarnation);
+        }
+        for (index, target) in observation.debt_projection.targets().iter().enumerate() {
+            checksum = checksum
+                .rotate_left(7)
+                .wrapping_add(target.observation.native_queue_bytes)
+                .wrapping_add(target.observation.snapshot.data_level_queue_bytes)
+                .wrapping_add(target.observation.incarnation)
+                .wrapping_add(if target.product_admission_active {
+                    1
+                } else {
+                    0
+                })
+                .wrapping_add(if target.observation.stale_for_original_data {
+                    1
+                } else {
+                    0
+                })
+                .wrapping_add(
+                    observation
+                        .debt_projection
+                        .exact_other_path_debt_bytes(index)
+                        .unwrap_or_default(),
+                );
+        }
+        checksum
+    }
+
+    #[test]
+    #[ignore = "offline paired complete Original-observation fixture; run manually with --ignored --nocapture"]
+    fn benchmark_prepared_original_observation_pairs() {
+        use std::hint::black_box;
+
+        const WARMUP_PAIRS: usize = 128;
+        // Fixed ABBA order balances each path. The row budget counts both scans in
+        // a reference pair; low-row cases are capped at 4096 pairs per block.
+        for target_count in [1, 2, 4] {
+            for retained_originals in [1, 16, 256, 4096] {
+                let (binding, _receivers) =
+                    original_observation_fixture(target_count, retained_originals);
+                let inputs = ResponsePreparedNativeInputs::resolve(binding.prepared_outputs());
+                let next_offset = (retained_originals as u64)
+                    .saturating_mul(16)
+                    .saturating_add(1);
+                let pairs_per_block = (2_000_000usize / (2 * retained_originals)).clamp(128, 4096);
+                let mut queue_bytes = 2usize;
+                binding.set_sender_queue_bytes(queue_bytes);
+
+                // Warm both branches outside the reported intervals. The queue
+                // value is toggled during miss pairs to guarantee a generation
+                // change on every iteration.
+                let (_, warm_reference_hit) = timed_original_observation_pairs(
+                    &binding,
+                    &inputs,
+                    next_offset,
+                    WARMUP_PAIRS,
+                    false,
+                    false,
+                    &mut queue_bytes,
+                );
+                let (_, warm_reuse_hit) = timed_original_observation_pairs(
+                    &binding,
+                    &inputs,
+                    next_offset,
+                    WARMUP_PAIRS,
+                    true,
+                    false,
+                    &mut queue_bytes,
+                );
+                assert_eq!(warm_reference_hit, warm_reuse_hit);
+                let (_, warm_reference_miss) = timed_original_observation_pairs(
+                    &binding,
+                    &inputs,
+                    next_offset,
+                    WARMUP_PAIRS,
+                    false,
+                    true,
+                    &mut queue_bytes,
+                );
+                let (_, warm_reuse_miss) = timed_original_observation_pairs(
+                    &binding,
+                    &inputs,
+                    next_offset,
+                    WARMUP_PAIRS,
+                    true,
+                    true,
+                    &mut queue_bytes,
+                );
+                assert_eq!(warm_reference_miss, warm_reuse_miss);
+
+                let mut hit_reference_elapsed = std::time::Duration::ZERO;
+                let mut hit_reuse_elapsed = std::time::Duration::ZERO;
+                let mut hit_reference_checksum = 0u64;
+                let mut hit_reuse_checksum = 0u64;
+                for block in 0..4 {
+                    let reuse_prior = block == 1 || block == 2;
+                    let (elapsed, checksum) = timed_original_observation_pairs(
+                        &binding,
+                        &inputs,
+                        next_offset,
+                        pairs_per_block,
+                        reuse_prior,
+                        false,
+                        &mut queue_bytes,
+                    );
+                    if reuse_prior {
+                        hit_reuse_elapsed += elapsed;
+                        hit_reuse_checksum = hit_reuse_checksum.wrapping_add(checksum);
+                    } else {
+                        hit_reference_elapsed += elapsed;
+                        hit_reference_checksum = hit_reference_checksum.wrapping_add(checksum);
+                    }
+                    eprintln!(
+                        "prepared Original hit pair: targets={target_count} retained_originals={retained_originals} round={block} arm={} pairs={pairs_per_block} ns_per_pair={:.1} checksum={checksum}",
+                        if reuse_prior { "reuse" } else { "reference" },
+                        elapsed.as_secs_f64() * 1_000_000_000.0 / pairs_per_block as f64,
+                    );
+                }
+                assert_eq!(hit_reference_checksum, hit_reuse_checksum);
+                black_box(hit_reference_checksum);
+
+                let mut miss_reference_elapsed = std::time::Duration::ZERO;
+                let mut miss_reuse_elapsed = std::time::Duration::ZERO;
+                let mut miss_reference_checksum = 0u64;
+                let mut miss_reuse_checksum = 0u64;
+                for block in 0..4 {
+                    let reuse_prior = block == 1 || block == 2;
+                    let (elapsed, checksum) = timed_original_observation_pairs(
+                        &binding,
+                        &inputs,
+                        next_offset,
+                        pairs_per_block,
+                        reuse_prior,
+                        true,
+                        &mut queue_bytes,
+                    );
+                    if reuse_prior {
+                        miss_reuse_elapsed += elapsed;
+                        miss_reuse_checksum = miss_reuse_checksum.wrapping_add(checksum);
+                    } else {
+                        miss_reference_elapsed += elapsed;
+                        miss_reference_checksum = miss_reference_checksum.wrapping_add(checksum);
+                    }
+                    eprintln!(
+                        "prepared Original miss pair: targets={target_count} retained_originals={retained_originals} round={block} arm={} pairs={pairs_per_block} ns_per_pair={:.1} checksum={checksum}",
+                        if reuse_prior { "reuse" } else { "reference" },
+                        elapsed.as_secs_f64() * 1_000_000_000.0 / pairs_per_block as f64,
+                    );
+                }
+                assert_eq!(miss_reference_checksum, miss_reuse_checksum);
+                black_box(miss_reference_checksum);
+                eprintln!(
+                    "prepared Original summary: targets={target_count} retained_originals={retained_originals} pairs_per_variant={} hit_reference_ns_per_pair={:.1} hit_reuse_ns_per_pair={:.1} generation_miss_reference_ns_per_pair={:.1} generation_miss_reuse_ns_per_pair={:.1}",
+                    pairs_per_block * 2,
+                    hit_reference_elapsed.as_secs_f64() * 1_000_000_000.0
+                        / (pairs_per_block * 2) as f64,
+                    hit_reuse_elapsed.as_secs_f64() * 1_000_000_000.0
+                        / (pairs_per_block * 2) as f64,
+                    miss_reference_elapsed.as_secs_f64() * 1_000_000_000.0
+                        / (pairs_per_block * 2) as f64,
+                    miss_reuse_elapsed.as_secs_f64() * 1_000_000_000.0
+                        / (pairs_per_block * 2) as f64,
+                );
+            }
+        }
     }
 }

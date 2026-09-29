@@ -1369,6 +1369,28 @@ impl ResponseDebtProjection {
         }
     }
 
+    /// Transfer only identity-indexed lower-range facts onto rebuilt targets.
+    /// The caller validates binding, offset and model generation, and preserves
+    /// the existing selected-native fence and advisory unselected inputs.
+    pub(super) fn retarget_unchanged(
+        self,
+        targets: Vec<ResponseSenderPathTarget>,
+    ) -> Result<Self, Vec<ResponseSenderPathTarget>> {
+        if self.targets.len() < 2
+            || self.targets.len() != targets.len()
+            || !self.targets.iter().zip(&targets).all(|(old, new)| {
+                ResponseAcquisitionOutputId::from(old) == ResponseAcquisitionOutputId::from(new)
+            })
+        {
+            return Err(targets);
+        }
+        Ok(Self {
+            oldest_owner: self.oldest_owner,
+            targets,
+            exact_other_path_debts: self.exact_other_path_debts,
+        })
+    }
+
     pub(in crate::runtime) fn targets(&self) -> &[ResponseSenderPathTarget] {
         &self.targets
     }

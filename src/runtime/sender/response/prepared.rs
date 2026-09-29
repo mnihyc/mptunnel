@@ -614,9 +614,10 @@ pub(in crate::runtime) fn claim_prepared_response_data(
         if let Some(shape) = shape {
             inputs.replace_fenced_target(identity, shape);
         }
-        let observation = owner
-            .binding()
-            .observe_prepared_original(&inputs, lane, offset)?;
+        let observation =
+            owner
+                .binding()
+                .reobserve_prepared_original(&inputs, lane, offset, observation)?;
         let recovery = state.sender.next_prepared_recovery(
             owner.binding(),
             &state.send_stream,

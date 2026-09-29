@@ -3,8 +3,8 @@ use super::super::test_support::{
     binding_for_underlay, qualify_product_assignment, stream_data_frame, with_output_entry_for_key,
 };
 use super::{
-    ResponseOutputAttachment, ResponseOutputAttachmentState, ResponsePathDetachOutcome,
-    ResponseProductRateEpoch, ResponseStreamAttachOutcome,
+    ResponseDebtProjection, ResponseOutputAttachment, ResponseOutputAttachmentState,
+    ResponsePathDetachOutcome, ResponseProductRateEpoch, ResponseStreamAttachOutcome,
 };
 use crate::model::path::{CarrierPathKey, PathPolicy};
 use crate::mux::MuxLimits;
@@ -1338,4 +1338,129 @@ fn peer_path_usage_rejects_stale_sequences_and_wrong_instances() {
         assert_eq!(entry.peer_usage, Some(PathUsage::Available));
         assert_eq!(entry.peer_usage_sequence, Some(3));
     });
+}
+
+#[test]
+fn unchanged_projection_moves_numbers_and_uses_fresh_target_fields() {
+    let (binding, _, _first_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let (commands, _second_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            UnderlayProtocol::Tcp,
+            PathId(11),
+            commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+
+    let old_targets = binding.sender_path_targets(TrafficClass::Throughput, 1);
+    assert_eq!(old_targets.len(), 2);
+    let owner = old_targets[0].observation;
+    let mut projection = ResponseDebtProjection::for_targets(old_targets.clone());
+    projection.add_range_debt(owner.key, owner.incarnation, 17);
+    let sums_ptr = projection
+        .exact_other_path_debts
+        .as_ref()
+        .expect("other target has debt")
+        .as_ptr();
+    let original_oldest_owner = projection.oldest_owner;
+
+    // These are fresh target fields supplied to retarget_unchanged. They must
+    // replace the advisory fields while the lower-range numbers move intact.
+    let mut fresh_targets = old_targets.clone();
+    let fresh_queue_bytes = fresh_targets[0]
+        .observation
+        .native_queue_bytes
+        .saturating_add(7);
+    fresh_targets[0].observation.native_queue_bytes = fresh_queue_bytes;
+    fresh_targets[0].observation.stale_for_original_data =
+        !fresh_targets[0].observation.stale_for_original_data;
+    fresh_targets[0].product_admission_active = !fresh_targets[0].product_admission_active;
+    let fresh_stale = fresh_targets[0].observation.stale_for_original_data;
+    let fresh_product_admission = fresh_targets[0].product_admission_active;
+
+    let reused = projection
+        .retarget_unchanged(fresh_targets)
+        .unwrap_or_else(|_| panic!("unchanged ordered identities permit reuse"));
+    assert!(std::ptr::eq(
+        sums_ptr,
+        reused.exact_other_path_debts.as_ref().unwrap().as_ptr(),
+    ));
+    assert_eq!(reused.oldest_owner, original_oldest_owner);
+    assert_eq!(reused.exact_other_path_debt_bytes(0), Some(0));
+    assert_eq!(reused.exact_other_path_debt_bytes(1), Some(17));
+    assert_eq!(
+        reused.targets[0].observation.native_queue_bytes,
+        fresh_queue_bytes
+    );
+    assert_eq!(
+        reused.targets[0].observation.stale_for_original_data,
+        fresh_stale
+    );
+    assert_eq!(
+        reused.targets[0].product_admission_active,
+        fresh_product_admission
+    );
+
+    // None is the established complete all-zero representation.
+    let zero = ResponseDebtProjection::for_targets(old_targets.clone());
+    assert!(zero.exact_other_path_debts.is_none());
+    let zero_reused = zero
+        .retarget_unchanged(binding.sender_path_targets(TrafficClass::Throughput, 1))
+        .unwrap_or_else(|_| panic!("unchanged ordered identities permit all-zero reuse"));
+    assert!(zero_reused.exact_other_path_debts.is_none());
+}
+
+#[test]
+fn unchanged_projection_rejects_order_exact_identity_and_single_target() {
+    let (binding, _, _first_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    let (commands, _second_receivers) = reliable_path_command_channels(8);
+    assert_eq!(
+        binding.attach(
+            UnderlayProtocol::Tcp,
+            PathId(11),
+            commands,
+            TrafficClass::Throughput,
+        ),
+        ResponseStreamAttachOutcome::Attached,
+    );
+    let targets = binding.sender_path_targets(TrafficClass::Throughput, 1);
+    assert_eq!(targets.len(), 2);
+
+    let mut reversed = targets.clone();
+    reversed.reverse();
+    assert!(
+        ResponseDebtProjection::for_targets(targets.clone())
+            .retarget_unchanged(reversed)
+            .is_err(),
+        "target order is part of the reuse key",
+    );
+
+    for changed_identity in 0..3 {
+        let mut changed = targets.clone();
+        match changed_identity {
+            0 => changed[0].observation.key = changed[1].observation.key,
+            1 => changed[0].observation.path_instance_id = changed[1].observation.path_instance_id,
+            2 => {
+                changed[0].observation.incarnation =
+                    changed[0].observation.incarnation.wrapping_add(1)
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            ResponseDebtProjection::for_targets(targets.clone())
+                .retarget_unchanged(changed)
+                .is_err(),
+            "key, carrier instance, and attachment incarnation must all match",
+        );
+    }
+
+    let one_target = targets[..1].to_vec();
+    assert!(
+        ResponseDebtProjection::for_targets(one_target.clone())
+            .retarget_unchanged(one_target)
+            .is_err(),
+        "single-target projections retain the reference path",
+    );
 }

@@ -1,5 +1,5 @@
-//! Exact product-range flight and STREAM_ACK ordering ownership.
-//! This layer linearizes product ACK release and flight identity; carrier ACK
+//! Product-range flight and STREAM_ACK ordering ownership.
+//! This layer linearizes product ACK release and current flight identity; carrier ACK
 //! and packet recovery remain below it, while sender ranking remains above it.
 
 use super::ack_clock::apply_response_ack_clock_release_samples;
@@ -47,6 +47,8 @@ use std::time::{Duration, Instant};
 ///
 /// STREAM_ACK releases this ledger entry from product flight; carrier ACKs only
 /// update carrier/path evidence and must not release product reinjection state.
+/// Finally retired, non-proving copies may retain one coverage witness per
+/// start offset; current and detaching attempts keep their exact identities.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct CarrierPathFlight {
     pub(super) key: CarrierPathKey,
@@ -148,7 +150,9 @@ pub(in crate::runtime) struct ResponseDataAckRelease {
 
 /// One locked owner for ordered Product payloads and their overlap/index state.
 /// Read-only map access preserves the established recovery iteration API;
-/// structural changes go through publication, indexed ACK release, or clear.
+/// structural changes go through publication, indexed ACK release, terminal-copy
+/// witness compaction, or clear. Dead witness identities are coverage evidence,
+/// not an inventory of every historical physical publication.
 #[derive(Debug, Default)]
 pub(in crate::runtime::stream) struct ResponseProductFlightLedger {
     flights: BTreeMap<u64, Vec<CarrierPathFlight>>,
@@ -207,6 +211,72 @@ impl ResponseProductFlightLedger {
         {
             flight.evidence_eligible = false;
         }
+    }
+
+    /// Collapse finally retired, non-proving copies with an identical start into
+    /// one real max-end coverage witness. OriginalData and every current or
+    /// detaching exact owner remain unchanged. Call only under the outputs lock
+    /// after final membership removal, never merely on a stale qualification.
+    ///
+    /// The identity index follows the retained storage, but lifetime U/M are NOT
+    /// recomputed or subtracted: an Original's release remains ambiguous where a
+    /// retired copy overlapped it. This is a representation change, not a
+    /// new delivery acknowledgement or permission to publish another copy.
+    pub(super) fn retire_and_compact_copies(
+        &mut self,
+        key: CarrierPathKey,
+        incarnation: u64,
+        protected: &[(CarrierPathKey, u64)],
+    ) -> usize {
+        let mut removed = 0;
+        for (&start, entries) in &mut self.flights {
+            let old_len = entries.len();
+            let mut witness: Option<usize> = None;
+            let mut write = 0;
+            for read in 0..old_len {
+                // Share the existing retirement traversal; do not add a second
+                // complete ledger pass just to collect coverage witnesses.
+                let flight = &mut entries[read];
+                if flight.key == key && flight.output_incarnation == incarnation {
+                    flight.evidence_eligible = false;
+                }
+                let retired_copy = flight.kind == CarrierWorkKind::ReinjectedData
+                    && !flight.evidence_eligible
+                    && flight.qualification_receipt.is_none()
+                    && !protected.contains(&(flight.key, flight.output_incarnation));
+                if retired_copy {
+                    if let Some(index) = witness {
+                        if entries[read].end > entries[index].end {
+                            entries[index] = entries[read];
+                        }
+                        continue;
+                    }
+                    witness = Some(write);
+                }
+                // Until a row is removed, every retained row is already in its
+                // final position. Do not rewrite its metadata on retirement.
+                if write != read {
+                    entries[write] = entries[read];
+                }
+                write += 1;
+            }
+            if write != old_len {
+                entries.truncate(write);
+                self.overlap.rebuild_bucket(
+                    start,
+                    old_len,
+                    entries.iter().map(|flight| flight.end),
+                );
+                // Allow a following replacement append without shrink/grow
+                // churn, but do not pin a once-large physical-attempt vector.
+                let reserve = write.saturating_mul(2);
+                if entries.capacity() > reserve {
+                    entries.shrink_to(reserve);
+                }
+                removed += old_len - write;
+            }
+        }
+        removed
     }
 
     fn tighten_original_recovery_timing(
@@ -390,10 +460,12 @@ pub(in crate::runtime) struct ResponseAckOrderingState {
 pub(in crate::runtime) struct ResponseAckOrderingUpdate {
     pub(super) changed: bool,
     pub(super) contiguous_frontier: u64,
-    /// Hole volume is observation-only; ordering still computes it locally to
-    /// detect semantic state changes in every build.
+    /// Observation-only volume. Ordinary change detection uses a transaction-
+    /// local delta; diagnostic builds still compute the exact reported total.
     #[cfg(feature = "lab-diagnostics")]
     pub(super) acked_hole_bytes: u64,
+    // Non-proving copies may be represented by one coverage witness per
+    // start. Consumers must not interpret their count as physical attempts.
     pub(super) newly_contiguous: Vec<CarrierPathAckedHole>,
 }
 
@@ -404,7 +476,57 @@ impl ResponseAckOrderingState {
         released: &[(u64, CarrierPathReleasedFlight)],
     ) -> ResponseAckOrderingUpdate {
         let previous_frontier = self.contiguous_frontier;
-        let previous_hole_bytes = self.acked_hole_bytes();
+        if self.acked_holes.is_empty() {
+            let mut covered = previous_frontier;
+            for range in ranges {
+                if range.start > covered {
+                    break;
+                }
+                covered = covered.max(range.end);
+            }
+            // Ordinary contiguous Original ACKs need no temporary hole map.
+            // Keep exact reference ordering: already-contiguous releases first,
+            // then the newly closed ordered prefix. Copies retain the general
+            // path's explicit witness quotient.
+            if released.iter().all(|(_, release)| {
+                release.flight.kind.is_original_transmission() && release.flight.end <= covered
+            }) && released.windows(2).all(|pair| pair[0].0 <= pair[1].0)
+            {
+                let mut newly_contiguous = Vec::with_capacity(released.len());
+                for already_contiguous in [true, false] {
+                    for (_, release) in released {
+                        let flight = release.flight;
+                        if (flight.end <= previous_frontier) != already_contiguous {
+                            continue;
+                        }
+                        newly_contiguous.push(CarrierPathAckedHole {
+                            key: flight.key,
+                            output_incarnation: flight.output_incarnation,
+                            end: flight.end,
+                            bytes: flight.bytes as u64,
+                            sent_at: flight.sent_at,
+                            kind: flight.kind,
+                            path_proving: release.path_proving,
+                        });
+                    }
+                }
+                self.contiguous_frontier = covered;
+                return ResponseAckOrderingUpdate {
+                    changed: covered != previous_frontier || !newly_contiguous.is_empty(),
+                    contiguous_frontier: covered,
+                    #[cfg(feature = "lab-diagnostics")]
+                    acked_hole_bytes: 0,
+                    newly_contiguous,
+                };
+            }
+        }
+        // Compare only the change to latest-Original hole volume. This is
+        // transaction-local, not a second maintained ledger or a query cache.
+        // Original extents partition the u64 stream-offset domain, so both
+        // totals fit u64. Wrapping differences telescope without requiring a
+        // signed total; zero means those totals agree. Drained rows separately
+        // set `changed` through frontier advancement or emitted records.
+        let mut hole_bytes_delta = 0_u64;
         let mut newly_contiguous = Vec::new();
 
         for (offset, release) in released {
@@ -421,28 +543,61 @@ impl ResponseAckOrderingState {
             if hole.end <= self.contiguous_frontier {
                 newly_contiguous.push(hole);
             } else {
-                self.acked_holes.entry(*offset).or_default().push(hole);
+                let holes = self.acked_holes.entry(*offset).or_default();
+                if hole.kind.is_original_transmission() {
+                    let previous =
+                        response_latest_original_hole(holes).map_or(0, |previous| previous.bytes);
+                    hole_bytes_delta = hole_bytes_delta
+                        .wrapping_sub(previous)
+                        .wrapping_add(hole.bytes);
+                }
+                // Flight release has already produced its accounting records;
+                // this step does not modify them. A non-proving copy contributes
+                // only coverage to ordering.
+                if hole.kind == CarrierWorkKind::ReinjectedData
+                    && !hole.path_proving
+                    && let Some(cover) = holes.iter_mut().find(|existing| {
+                        existing.kind == CarrierWorkKind::ReinjectedData && !existing.path_proving
+                    })
+                {
+                    // Equal starts make their union the largest endpoint. Keep
+                    // a real witness rather than synthesizing path authority.
+                    if hole.end > cover.end {
+                        *cover = hole;
+                    }
+                } else {
+                    holes.push(hole);
+                }
             }
         }
 
         self.advance_contiguous_frontier(ranges);
         let frontier = self.contiguous_frontier;
-        self.acked_holes.retain(|_, holes| {
-            holes.retain(|hole| {
-                if hole.end <= frontier {
-                    newly_contiguous.push(*hole);
-                    false
-                } else {
-                    true
-                }
+        // With no reachable start, every retained end is beyond the
+        // frontier. A duplicate/gap ACK need not sweep unrelated holes.
+        if self
+            .acked_holes
+            .first_key_value()
+            .is_some_and(|(start, _)| *start <= frontier)
+        {
+            self.acked_holes.retain(|_, holes| {
+                holes.retain(|hole| {
+                    if hole.end <= frontier {
+                        newly_contiguous.push(*hole);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                !holes.is_empty()
             });
-            !holes.is_empty()
-        });
+        }
+        #[cfg(feature = "lab-diagnostics")]
         let acked_hole_bytes = self.acked_hole_bytes();
 
         ResponseAckOrderingUpdate {
             changed: previous_frontier != self.contiguous_frontier
-                || previous_hole_bytes != acked_hole_bytes
+                || hole_bytes_delta != 0
                 || !newly_contiguous.is_empty(),
             contiguous_frontier: self.contiguous_frontier,
             #[cfg(feature = "lab-diagnostics")]
@@ -452,33 +607,39 @@ impl ResponseAckOrderingState {
     }
 
     fn advance_contiguous_frontier(&mut self, ranges: &[OffsetRange]) {
+        // Reachability is the ordered union of newly acknowledged masks and
+        // stored holes. Do not freeze a BTree range at the old frontier: a
+        // chain of adjacent holes would then rescan its prefix for every hop.
+        let mut masks = ranges.iter().peekable();
+        let mut holes = self.acked_holes.iter().peekable();
+        let mut frontier = self.contiguous_frontier;
         loop {
-            let mut next_frontier = self.contiguous_frontier;
-            for range in ranges {
-                if range.start > next_frontier {
+            let take_mask = match (masks.peek(), holes.peek()) {
+                (Some(mask), Some((start, _))) => mask.start <= **start,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_mask {
+                let mask = masks.next().expect("peeked ACK mask");
+                if mask.start > frontier {
                     break;
                 }
-                if range.end > next_frontier {
-                    next_frontier = range.end;
-                }
-            }
-            for (offset, holes) in self.acked_holes.range(..=next_frontier) {
-                if *offset > next_frontier {
+                frontier = frontier.max(mask.end);
+            } else {
+                let (start, entries) = holes.next().expect("peeked ACK hole");
+                if *start > frontier {
                     break;
                 }
-                for hole in holes {
-                    if hole.end > next_frontier {
-                        next_frontier = hole.end;
-                    }
+                for hole in entries {
+                    frontier = frontier.max(hole.end);
                 }
             }
-            if next_frontier == self.contiguous_frontier {
-                break;
-            }
-            self.contiguous_frontier = next_frontier;
         }
+        self.contiguous_frontier = frontier;
     }
 
+    #[cfg(any(test, feature = "lab-diagnostics"))]
     pub(super) fn acked_hole_bytes(&self) -> u64 {
         self.acked_holes
             .values()
@@ -1463,7 +1624,7 @@ impl ResponseStreamBinding {
             lab_diagnostic(
                 "server_ack_ordering_state",
                 format_args!(
-                    "session_id={} contiguous_frontier={} acked_hole_bytes={} released_flights={}",
+                    "session_id={} contiguous_frontier={} acked_hole_bytes={} released_history_rows={}",
                     self.session_id.0,
                     ordering_update.contiguous_frontier,
                     ordering_update.acked_hole_bytes,
@@ -2255,16 +2416,47 @@ impl ResponseStreamBinding {
         Ok(())
     }
 
+    /// The caller holds the outputs guard across final retirement and this
+    /// compaction, so no successor admission sees a half-updated ledger.
+    pub(super) fn retire_path_flight_evidence(
+        &self,
+        key: CarrierPathKey,
+        output_incarnation: u64,
+        outputs: &ResponseStreamOutputs,
+    ) {
+        let protected = outputs
+            .entries
+            .iter()
+            .chain(&outputs.detaching)
+            .map(|entry| (entry.key, entry.incarnation))
+            .collect::<SmallVec<[_; 4]>>();
+        self.invalidate_path_flight_evidence_inner(key, output_incarnation, Some(&protected));
+    }
+
     pub(super) fn invalidate_path_flight_evidence(
         &self,
         key: CarrierPathKey,
         output_incarnation: u64,
     ) {
+        // Stale qualification revokes evidence, not physical-attempt ownership.
+        self.invalidate_path_flight_evidence_inner(key, output_incarnation, None);
+    }
+
+    fn invalidate_path_flight_evidence_inner(
+        &self,
+        key: CarrierPathKey,
+        output_incarnation: u64,
+        protected: Option<&[(CarrierPathKey, u64)]>,
+    ) {
         let mut flights = self
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        flights.invalidate_evidence(key, output_incarnation);
+        if let Some(protected) = protected {
+            flights.retire_and_compact_copies(key, output_incarnation, protected);
+        } else {
+            flights.invalidate_evidence(key, output_incarnation);
+        }
         drop(flights);
         let mut ordering = self
             .ack_ordering
@@ -2275,8 +2467,8 @@ impl ResponseStreamBinding {
                 .iter_mut()
                 .filter(|hole| hole.key == key && hole.output_incarnation == output_incarnation)
             {
-                // Ordering ownership remains exact; only stale Product
-                // evidence authority is revoked.
+                // Keep ordering coverage while revoking this owner's Product
+                // evidence authority.
                 hole.path_proving = false;
             }
         }
@@ -2286,9 +2478,9 @@ impl ResponseStreamBinding {
         &self,
         frame: &Frame,
     ) -> Vec<(CarrierPathKey, u64)> {
-        // Exact physical attempts remain in the Product ledger until DataACK.
-        // The stable-slot variant below decides whether a current successor
-        // inherits local publication authority.
+        // Current/detaching attempts remain exact. Finally retired copies may
+        // use max-end coverage witnesses; these identities carry no current
+        // publication authority. The stable-slot query below filters membership.
         self.all_flight_outputs_overlapping_frame(frame)
     }
 
@@ -3346,3 +3538,11 @@ mod tests;
 #[cfg(test)]
 #[path = "tests_prepared_recovery_timing.rs"]
 mod tests_prepared_recovery;
+
+#[cfg(test)]
+#[path = "tests_ack_linear.rs"]
+mod tests_ack_linear;
+
+#[cfg(test)]
+#[path = "tests_retired_history.rs"]
+mod tests_retired_history;

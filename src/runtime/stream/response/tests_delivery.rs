@@ -1570,7 +1570,7 @@ fn committed_recovery_copy_releases_publication_at_detach_start() {
 }
 
 #[test]
-fn retired_slot_generations_retain_physical_attempts_until_stream_ack() {
+fn retired_slot_generations_preserve_coverage_without_unbounded_attempt_rows() {
     const ROTATIONS: usize = 6;
     let (binding, owner, _owner_receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
     let copy = key(UnderlayProtocol::Tcp, 5);
@@ -1665,14 +1665,11 @@ fn retired_slot_generations_retain_physical_attempts_until_stream_ack() {
                 .iter()
                 .filter(|flight| flight.kind == CarrierWorkKind::ReinjectedData)
                 .collect::<Vec<_>>();
-            assert_eq!(records.len(), accepted_incarnations.len());
+            assert_eq!(records.len(), accepted_incarnations.len().min(2));
             assert_eq!(
-                records
-                    .iter()
-                    .map(|flight| flight.output_incarnation)
-                    .collect::<Vec<_>>(),
-                accepted_incarnations,
-                "each physical copy keeps its exact incarnation identity"
+                records.last().expect("current copy").output_incarnation,
+                identity.incarnation,
+                "the currently accepted copy keeps its exact incarnation"
             );
             assert!(records.iter().all(|flight| {
                 flight.configured_slot == Some(stable_slot)
@@ -1685,7 +1682,7 @@ fn retired_slot_generations_retain_physical_attempts_until_stream_ack() {
                     .iter()
                     .all(|(start, end, _, _)| (*start, *end) == (0, 4096))
             );
-            assert_eq!(geometry.len(), 1 + accepted_incarnations.len());
+            assert_eq!(geometry.len(), 1 + accepted_incarnations.len().min(2));
             assert_eq!(flights.overlap.flight_count(), geometry.len());
         }
 
@@ -1706,6 +1703,19 @@ fn retired_slot_generations_retain_physical_attempts_until_stream_ack() {
             | super::super::ResponsePathDetachOutcome::Pending(incarnation) => incarnation,
         };
         binding.complete_path_detach(copy, path_instance_id, incarnation);
+        {
+            let flights = binding.flights.lock().expect("response flights");
+            assert_eq!(flights.retained_geometry_for_test().len(), 2);
+            assert_eq!(flights.overlap.flight_count(), 2);
+            assert_eq!(
+                flights
+                    .overlap
+                    .ambiguous_intersections_for_ack(&[range(0, 4096)]),
+                vec![range(0, 4096)],
+                "compaction must not erase lifetime overlap evidence"
+            );
+            assert!(uncopied_completion_prefix(&flights, range(0, 4096)).is_none());
+        }
         assert_eq!(
             binding.accepted_reinjected_data_in_flight_bytes_at(identity),
             0,
@@ -3254,4 +3264,68 @@ fn blocking_flight_cannot_inherit_a_replacement_output_snapshot() {
         "an old OriginalData flight must not borrow timing from a replacement carrier"
     );
     assert!(binding.has_multipath_reinjection_alternative());
+}
+
+#[test]
+fn retired_copy_witness_preserves_live_and_detaching_rows_and_partial_ack_evidence() {
+    let original_key = key(UnderlayProtocol::Tcp, 1);
+    let old_key = key(UnderlayProtocol::Tcp, 2);
+    let current_key = key(UnderlayProtocol::Udp, 3);
+    let detaching_key = key(UnderlayProtocol::Tcp, 4);
+    let mut ledger = ResponseProductFlightLedger::default();
+    let original = flight(original_key, 64, 64, CarrierWorkKind::OriginalData);
+    ledger.publish(0, original);
+    for generation in 1..=100 {
+        let mut copy = flight(
+            old_key,
+            16 + generation % 32,
+            16 + generation as usize % 32,
+            CarrierWorkKind::ReinjectedData,
+        );
+        copy.output_incarnation = generation;
+        copy.evidence_eligible = false;
+        ledger.publish(0, copy);
+    }
+    let mut current = flight(current_key, 40, 40, CarrierWorkKind::ReinjectedData);
+    current.output_incarnation = 7;
+    current.evidence_eligible = false; // Stale is NOT finally detached.
+    let mut detaching = flight(detaching_key, 48, 48, CarrierWorkKind::ReinjectedData);
+    detaching.output_incarnation = 8;
+    detaching.evidence_eligible = false;
+    ledger.publish(0, current);
+    ledger.publish(0, detaching);
+    let protected = [(original_key, 0), (current_key, 7), (detaching_key, 8)];
+    assert_eq!(
+        ledger.retire_and_compact_copies(old_key, 100, &protected),
+        99
+    );
+    let bucket = ledger.get(&0).expect("retained start");
+    assert_eq!(bucket.len(), 4);
+    assert_eq!(flight_state(bucket[0]), flight_state(original));
+    assert_eq!(flight_state(bucket[2]), flight_state(current));
+    assert_eq!(flight_state(bucket[3]), flight_state(detaching));
+    assert_eq!(bucket[1].end, 47);
+    assert_eq!(ledger.overlap.flight_count(), 4);
+    assert_eq!(
+        ledger.retire_and_compact_copies(old_key, 100, &protected),
+        0
+    );
+    let released = ledger.release(&[range(0, 24)]);
+    assert_eq!(released.len(), 4);
+    assert!(released.iter().all(|(_, released)| !released.path_proving));
+    assert!(ledger.get(&0).is_none());
+    assert_eq!(ledger.get(&24).expect("retained right fragments").len(), 4);
+    assert_eq!(
+        ledger.retire_and_compact_copies(old_key, 100, &protected),
+        0
+    );
+    let tail = ledger.release(&[range(24, 64)]);
+    let proving = tail
+        .iter()
+        .filter(|(_, release)| release.path_proving)
+        .map(|(start, release)| range(*start, release.flight.end))
+        .collect::<Vec<_>>();
+    assert_eq!(proving, vec![range(48, 64)]);
+    assert!(ledger.is_empty());
+    assert_eq!(ledger.overlap.flight_count(), 0);
 }

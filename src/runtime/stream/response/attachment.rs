@@ -862,7 +862,7 @@ impl ResponseStreamBinding {
             output.load_registration.set_lane(lane);
         }
         if let Some(incarnation) = replaced_incarnation {
-            self.invalidate_path_flight_evidence(key, incarnation);
+            self.retire_path_flight_evidence(key, incarnation, &outputs);
         }
         self.response_model_generation
             .fetch_add(1, Ordering::AcqRel);
@@ -1009,7 +1009,7 @@ impl ResponseStreamBinding {
         outputs.detaching.retain(&mut retain);
         if !removed.is_empty() {
             for (incarnation, _) in &removed {
-                self.invalidate_path_flight_evidence(key, *incarnation);
+                self.retire_path_flight_evidence(key, *incarnation, &outputs);
             }
             for (_, path_instance_id) in &removed {
                 self.clear_request_feedback_ingress_if(key, *path_instance_id);

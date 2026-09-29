@@ -132,7 +132,12 @@ third transport protocol.
 **Product ownership or Product flight**
 : One exact original or reinjected MPP range retained until MPP Data ACK or its
   exact Product-terminal rule. It is logical delivery/recovery state, not
-  native transport flight or queue ownership.
+  native transport flight or queue ownership. An implementation may compact
+  finally retired, non-proving copy metadata only while preserving historical
+  copy coverage, pre-ACK ambiguity, authoritative release and all live/detaching
+  exact-owner decisions. Retirement MUST NOT acknowledge bytes or create new
+  publication authority. The response implementation's representation and
+  exclusions are specified in `docs/ACK_HISTORY_MODEL.md`.
 
 **Original transmission**
 : The first assignment of an MPP stream byte range to a carrier.

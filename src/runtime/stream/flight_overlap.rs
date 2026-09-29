@@ -1,10 +1,14 @@
 //! Product-flight overlap ownership shared by the request and response ledgers.
 //!
 //! `covered` (U) and `ambiguous` (M) describe byte multiplicity across the
-//! retained Product flights. Publishing a new flight I applies
+//! retained Product publications. A response owner may compact finally retired
+//! copies into coverage witnesses while preserving U/M until Product ACK; the
+//! physical identity count then differs from historical multiplicity.
+//! Publishing a new flight I applies
 //! `M += U ∩ I; U += I`. An authoritative Product ACK removes every copy in
 //! its mask, so callers snapshot M before mutation and then subtract the mask
-//! from both unions. Failed/evidence-invalid flights stay retained. Retained
+//! from both unions. Failure or evidence invalidation does not release covered
+//! bytes. Retained
 //! ACK fragments are indexed without being published again. A selective
 //! one-flight deletion is deliberately not exposed: U/M alone cannot represent
 //! its multiplicity change.
@@ -571,6 +575,9 @@ impl ProductFlightIndex {
     }
 
     /// Update the identity set while preserving the current lifetime's U/M.
+    /// Final-retirement compaction may retain one non-proving coverage witness
+    /// in place of nested retired copies. Their historical ambiguity remains in
+    /// M until a Product ACK; do not infer M afresh from compact physical rows.
     /// Single retains its original summary until `finish_partial_ack`, because
     /// a split may briefly have no start-key fragment before a staged right
     /// fragment is reinserted.
@@ -718,7 +725,10 @@ impl ProductFlightIndex {
     }
 
     #[cfg(test)]
-    fn covered_intersections(&self, range: OffsetRange) -> Vec<OffsetRange> {
+    pub(in crate::runtime::stream) fn covered_intersections(
+        &self,
+        range: OffsetRange,
+    ) -> Vec<OffsetRange> {
         match &self.state {
             ProductFlightIndexState::Indexed(indexed) => indexed.covered.intersections(range),
             ProductFlightIndexState::Single { key, end } => {

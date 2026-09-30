@@ -2737,15 +2737,17 @@ impl ResponseStreamBinding {
         &self,
         observed_at: Instant,
     ) -> (Vec<OffsetRange>, Option<Instant>) {
-        let observation = self.observe_prepared_copy_work(observed_at);
+        let observation = self.observe_prepared_copy_work(observed_at, false);
         (observation.covered, observation.next_deadline)
     }
 
-    /// Join the two readers at their common authoritative lock boundary.
-    /// Time-dependent suppression is recomputed on every invocation.
+    /// Observe suppression coverage and deadlines while omitting slot-debt
+    /// classification when the caller has proved there can be no recovery
+    /// target. A later debt read still uses the established reference query.
     pub(in crate::runtime) fn observe_prepared_copy_work(
         &self,
         observed_at: Instant,
+        collect_debt: bool,
     ) -> ResponsePreparedCopyObservation<'_> {
         let outputs = self
             .outputs
@@ -2755,7 +2757,9 @@ impl ResponseStreamBinding {
             .flights
             .lock()
             .expect("server reliable stream flight lock");
-        let mut debt = PreparedCopyDebtView::from_outputs(&outputs);
+        let mut debt = collect_debt
+            .then(|| PreparedCopyDebtView::from_outputs(&outputs))
+            .flatten();
         let mut covered = Vec::new();
         let mut next_deadline = None::<Instant>;
         for (&start, entries) in flights.iter() {

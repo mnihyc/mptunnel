@@ -288,17 +288,22 @@ impl ServerResponseSenderService {
         ready: &[ResponseAcquisitionOutputId],
         observed_at: Instant,
     ) -> ResponsePreparedRecoveryObservation {
-        let copy_work = binding.observe_prepared_copy_work(observed_at);
+        let retained = send_stream.retained_ranges_in_scope(OffsetRange {
+            start: send_stream.data_ack_frontier(),
+            end: send_stream.next_offset(),
+        });
+        // The selection-quantum fold below is empty without a ready target,
+        // and no recovery range exists when retained is empty. In either case
+        // debt cannot reach an admission decision. Keep the same coherent
+        // suppression/deadline observation for the remaining wake behavior.
+        let copy_work = binding
+            .observe_prepared_copy_work(observed_at, !retained.is_empty() && !ready.is_empty());
         let covered = &copy_work.covered;
         let mut next_deadline = copy_work.next_deadline;
         // Both the exceptional frontier attempt and the ordinary fallback are
         // one discovery observation. Reuse one coherent slot-debt snapshot if
         // the first range falls through; final admission still revalidates it.
         let mut target_copy_debts = None;
-        let retained = send_stream.retained_ranges_in_scope(OffsetRange {
-            start: send_stream.data_ack_frontier(),
-            end: send_stream.next_offset(),
-        });
         if (send_stream.next_offset() == send_stream.peer_max_offset()
             || authoritative_ack.reports_frontier(send_stream))
             && let Some(range) = retained.first().copied()

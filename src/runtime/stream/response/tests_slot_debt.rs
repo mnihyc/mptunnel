@@ -441,14 +441,18 @@ fn prepared_copy_view_matches_fresh_debt_after_expiry_and_mutation() {
         let now = Instant::now();
         // Expiry changes suppression coverage, never configured-slot debt.
         for observed_at in [now, now + Duration::from_secs(3600)] {
-            let view = fixture.binding.observe_prepared_copy_work(observed_at);
+            let view = fixture
+                .binding
+                .observe_prepared_copy_work(observed_at, true);
             assert_eq!(
                 view.accepted_debts(&identities),
                 fixture
                     .binding
                     .accepted_reinjected_data_in_flight_bytes_for_outputs_at(&identities),
             );
-            let stale_view = fixture.binding.observe_prepared_copy_work(observed_at);
+            let stale_view = fixture
+                .binding
+                .observe_prepared_copy_work(observed_at, true);
             fixture
                 .binding
                 .record_reinjected_flight(fixture.keys[0], &stream_data_frame_at(7_000_000, 512));
@@ -460,7 +464,7 @@ fn prepared_copy_view_matches_fresh_debt_after_expiry_and_mutation() {
                 "generation change must abandon the pre-publication debt view",
             );
         }
-        let view = fixture.binding.observe_prepared_copy_work(now);
+        let view = fixture.binding.observe_prepared_copy_work(now, true);
         let duplicate_ids = [identities[0], identities[0]];
         assert_eq!(
             view.accepted_debts(&duplicate_ids)[0],
@@ -475,9 +479,33 @@ fn prepared_copy_view_matches_fresh_debt_after_expiry_and_mutation() {
 }
 
 #[test]
+fn prepared_copy_coverage_can_skip_unrequested_debt_classification() {
+    let (fixture, identities) = populated_benchmark_fixture(4, true);
+    let observed_at = Instant::now();
+    set_audit_copy_deadline(&fixture.binding, Some(observed_at + Duration::from_secs(1)));
+
+    let joined = fixture
+        .binding
+        .observe_prepared_copy_work(observed_at, true);
+    let coverage_only = fixture
+        .binding
+        .observe_prepared_copy_work(observed_at, false);
+    assert_eq!(coverage_only.covered, joined.covered);
+    assert_eq!(coverage_only.next_deadline, joined.next_deadline);
+
+    let expected = fixture
+        .binding
+        .accepted_reinjected_data_in_flight_bytes_for_outputs_at(&identities);
+    assert_eq!(joined.accepted_debts(&identities), expected);
+    assert_eq!(coverage_only.accepted_debts(&identities), expected);
+}
+
+#[test]
 fn same_generation_copy_view_does_not_lock_the_flight_ledger() {
     let (fixture, identities) = populated_benchmark_fixture(4, true);
-    let view = fixture.binding.observe_prepared_copy_work(Instant::now());
+    let view = fixture
+        .binding
+        .observe_prepared_copy_work(Instant::now(), true);
     let expected = fixture
         .binding
         .accepted_reinjected_data_in_flight_bytes_for_outputs_at(&identities);
@@ -498,8 +526,6 @@ fn same_generation_copy_view_does_not_lock_the_flight_ledger() {
         );
     });
 }
-
-// Append to tests_slot_debt.rs after its existing helpers/imports.
 
 fn reference_prepared_coverage_audit(
     binding: &ResponseStreamBinding,
@@ -583,7 +609,7 @@ fn assert_prepared_view_matches_audit(
     let fresh = binding.accepted_reinjected_data_in_flight_bytes_for_outputs_at(ids);
     let mask = byte_mask_slot_debts_audit(binding, ids);
     assert_eq!(fresh.as_slice(), mask.as_slice());
-    let view = binding.observe_prepared_copy_work(at);
+    let view = binding.observe_prepared_copy_work(at, true);
     assert_eq!(view.covered, coverage);
     assert_eq!(view.next_deadline, deadline);
     let debts = view.accepted_debts(ids);
@@ -781,7 +807,9 @@ fn stale_prepared_view_falls_back_after_ack_and_replacement() {
         .binding
         .record_reinjected_flight(key, &stream_data_frame_at(0, 1024));
     let old = output_identity(&fixture.binding, key);
-    let before_ack = fixture.binding.observe_prepared_copy_work(Instant::now());
+    let before_ack = fixture
+        .binding
+        .observe_prepared_copy_work(Instant::now(), true);
     assert_eq!(before_ack.accepted_debts(&[old]).as_slice(), [1024]);
     fixture
         .binding
@@ -795,7 +823,9 @@ fn stale_prepared_view_falls_back_after_ack_and_replacement() {
         [768]
     );
 
-    let before_full_ack = fixture.binding.observe_prepared_copy_work(Instant::now());
+    let before_full_ack = fixture
+        .binding
+        .observe_prepared_copy_work(Instant::now(), true);
     fixture
         .binding
         .release_normalized_acked_ranges(&[OffsetRange {
@@ -807,7 +837,9 @@ fn stale_prepared_view_falls_back_after_ack_and_replacement() {
         .binding
         .record_reinjected_flight(key, &stream_data_frame_at(4096, 512));
     let predecessor = output_identity(&fixture.binding, key);
-    let stale = fixture.binding.observe_prepared_copy_work(Instant::now());
+    let stale = fixture
+        .binding
+        .observe_prepared_copy_work(Instant::now(), true);
     let instance = with_output_entry_for_key(&fixture.binding, key, |e| e.path_instance_id);
     let incarnation = match fixture.binding.begin_path_detach(key, instance) {
         Some(ResponsePathDetachOutcome::Begun(i)) => i,
@@ -842,7 +874,9 @@ fn prepared_view_preserves_poisoned_flight_query_behavior() {
         .binding
         .record_reinjected_flight(key, &stream_data_frame_at(0, 512));
     let id = output_identity(&fixture.binding, key);
-    let view = fixture.binding.observe_prepared_copy_work(Instant::now());
+    let view = fixture
+        .binding
+        .observe_prepared_copy_work(Instant::now(), true);
     let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _guard = fixture.binding.flights.lock().unwrap();
         panic!("isolated poison");
@@ -913,7 +947,7 @@ fn generated_prepared_copy_observations_match_byte_ownership_after_ack() {
             incarnation: u64::MAX,
         });
         assert_prepared_view_matches_audit(&fixture.binding, &ids, at);
-        let prior = fixture.binding.observe_prepared_copy_work(at);
+        let prior = fixture.binding.observe_prepared_copy_work(at, true);
         let ack_start = next() % 96;
         fixture
             .binding
@@ -923,238 +957,5 @@ fn generated_prepared_copy_observations_match_byte_ownership_after_ack() {
             }]);
         let (_, _, debt) = assert_prepared_view_matches_audit(&fixture.binding, &ids, at);
         assert_eq!(prior.accepted_debts(&ids).as_slice(), debt);
-    }
-}
-
-// Append after append_ready_tests.rs in tests_slot_debt.rs.
-
-fn fold_observation_audit(mut sum: u64, ranges: &[OffsetRange], deadline: Option<Instant>) -> u64 {
-    sum = sum
-        .rotate_left(5)
-        .wrapping_add(ranges.len() as u64)
-        .wrapping_add(deadline.is_some() as u64);
-    for r in ranges {
-        sum = sum.rotate_left(7).wrapping_add(r.start).wrapping_add(r.end);
-    }
-    sum
-}
-
-fn fold_debt_audit(mut sum: u64, debts: &[usize]) -> u64 {
-    for (i, debt) in debts.iter().copied().enumerate() {
-        sum = sum
-            .rotate_left(7)
-            .wrapping_add(debt as u64)
-            .wrapping_add(i as u64 + 1);
-    }
-    sum
-}
-
-fn time_observation_audit(
-    binding: &ResponseStreamBinding,
-    ids: &[ServerReinjectionOutputIdentity],
-    at: Instant,
-    iterations: usize,
-    joined: bool,
-    consume_debt: bool,
-) -> (Duration, u64) {
-    let started = Instant::now();
-    let mut sum = 0x9e37_79b9_u64;
-    for _ in 0..iterations {
-        if joined {
-            let view = binding.observe_prepared_copy_work(at);
-            sum = fold_observation_audit(sum, black_box(&view.covered), view.next_deadline);
-            if consume_debt {
-                let debts = view.accepted_debts(ids);
-                sum = fold_debt_audit(sum, black_box(debts.as_slice()));
-            }
-        } else {
-            let (ranges, deadline) = reference_prepared_coverage_audit(binding, at);
-            sum = fold_observation_audit(sum, black_box(&ranges), deadline);
-            if consume_debt {
-                let debts = binding.accepted_reinjected_data_in_flight_bytes_for_outputs_at(ids);
-                sum = fold_debt_audit(sum, black_box(debts.as_slice()));
-            }
-        }
-    }
-    (started.elapsed(), black_box(sum))
-}
-
-fn current_domain_count_audit(binding: &ResponseStreamBinding) -> usize {
-    let outputs = binding.outputs.lock().expect("test outputs");
-    let mut domains = Vec::new();
-    for entry in &outputs.entries {
-        let domain = (entry.key.underlay, entry.configured_slot);
-        if !domains.contains(&domain) {
-            domains.push(domain);
-        }
-    }
-    domains.len()
-}
-
-fn copy_count_audit(binding: &ResponseStreamBinding) -> usize {
-    binding
-        .flights
-        .lock()
-        .expect("test flights")
-        .values()
-        .flatten()
-        .filter(|f| f.kind == crate::model::work::CarrierWorkKind::ReinjectedData)
-        .count()
-}
-
-#[test]
-#[ignore = "manual complete coverage/debt timing probe; run with --ignored --nocapture"]
-fn benchmark_prepared_copy_complete_observation_audit() {
-    for (copies, shared_slot) in [(false, false), (true, false), (true, true)] {
-        for rows in [1usize, 16, 256, 4096] {
-            let fixture = fixture_with_tcp_outputs(4);
-            if shared_slot {
-                for key in fixture.keys.iter().copied() {
-                    set_slot(&fixture.binding, key, 77);
-                }
-            }
-            seed_audit_rows(&fixture, rows, copies);
-            let at = Instant::now();
-            set_audit_copy_deadline(&fixture.binding, Some(at + Duration::from_secs(3600)));
-            let ids = fixture
-                .keys
-                .iter()
-                .copied()
-                .map(|k| output_identity(&fixture.binding, k))
-                .collect::<Vec<_>>();
-            let retained = retained_flight_count(&fixture.binding);
-            let copy_rows = copy_count_audit(&fixture.binding);
-            let domains = current_domain_count_audit(&fixture.binding);
-            // Keep each block near a stable amount of ledger work while ensuring
-            // enough repetitions for the one-row cases.
-            let iterations = (2_000_000usize / rows).clamp(128, 8192);
-            for (joined, consume) in [(false, true), (true, true), (false, false), (true, false)] {
-                time_observation_audit(&fixture.binding, &ids, at, 2, joined, consume); // warmup
-            }
-            let mut full_checksum = None;
-            let mut unused_checksum = None;
-            for round in 0..4 {
-                let full_order = if round % 2 == 0 {
-                    [false, true, true, false]
-                } else {
-                    [true, false, false, true]
-                };
-                for (position, joined) in full_order.into_iter().enumerate() {
-                    let (elapsed, sum) = time_observation_audit(
-                        &fixture.binding,
-                        &ids,
-                        at,
-                        iterations,
-                        joined,
-                        true,
-                    );
-                    if let Some(expected) = full_checksum {
-                        assert_eq!(sum, expected);
-                    } else {
-                        full_checksum = Some(sum);
-                    }
-                    eprintln!(
-                        "recovery-observation rows={rows} retained={retained} members={} copies={copy_rows} domains={domains} slot_shape={} debt=used round={} position={} arm={} iterations={iterations} raw_ns_per_observation={:.1} checksum={sum}",
-                        ids.len(),
-                        if shared_slot { "shared" } else { "distinct" },
-                        round + 1,
-                        position + 1,
-                        if joined { "joined" } else { "reference" },
-                        elapsed.as_secs_f64() * 1e9 / iterations as f64
-                    );
-                }
-                let unused_order = if round % 2 == 0 {
-                    [false, true, true, false]
-                } else {
-                    [true, false, false, true]
-                };
-                for (position, joined) in unused_order.into_iter().enumerate() {
-                    let (elapsed, sum) = time_observation_audit(
-                        &fixture.binding,
-                        &ids,
-                        at,
-                        iterations,
-                        joined,
-                        false,
-                    );
-                    if let Some(expected) = unused_checksum {
-                        assert_eq!(sum, expected);
-                    } else {
-                        unused_checksum = Some(sum);
-                    }
-                    eprintln!(
-                        "recovery-observation rows={rows} retained={retained} members={} copies={copy_rows} domains={domains} slot_shape={} debt=unused round={} position={} arm={} iterations={iterations} raw_ns_per_observation={:.1} checksum={sum}",
-                        ids.len(),
-                        if shared_slot { "shared" } else { "distinct" },
-                        round + 1,
-                        position + 1,
-                        if joined { "joined" } else { "reference" },
-                        elapsed.as_secs_f64() * 1e9 / iterations as f64
-                    );
-                }
-            }
-        }
-    }
-
-    // Isolate generation-miss fallback cost: create the view, mutate accepted
-    // copy geometry once to advance the generation, then time stale-view reads
-    // against the same fresh batched query. The mutation is outside both timers.
-    let fixture = fixture_with_tcp_outputs(4);
-    for key in fixture.keys.iter().copied() {
-        set_slot(&fixture.binding, key, 77);
-    }
-    seed_audit_rows(&fixture, 16, true);
-    let at = Instant::now();
-    let ids = fixture
-        .keys
-        .iter()
-        .copied()
-        .map(|k| output_identity(&fixture.binding, k))
-        .collect::<Vec<_>>();
-    let stale_view = fixture.binding.observe_prepared_copy_work(at);
-    fixture
-        .binding
-        .record_reinjected_flight(fixture.keys[0], &stream_data_frame_at(1_000_000, 512));
-    let iterations = 8192;
-    let mut expected = None;
-    for round in 0..4 {
-        let order = if round % 2 == 0 {
-            [false, true, true, false]
-        } else {
-            [true, false, false, true]
-        };
-        for (position, via_view) in order.into_iter().enumerate() {
-            let started = Instant::now();
-            let mut sum = 0x9e37_79b9_u64;
-            for _ in 0..iterations {
-                let debts = if via_view {
-                    stale_view.accepted_debts(&ids)
-                } else {
-                    fixture
-                        .binding
-                        .accepted_reinjected_data_in_flight_bytes_for_outputs_at(&ids)
-                };
-                sum = fold_debt_audit(sum, black_box(debts.as_slice()));
-            }
-            let elapsed = started.elapsed();
-            if let Some(value) = expected {
-                assert_eq!(sum, value);
-            } else {
-                expected = Some(sum);
-            }
-            eprintln!(
-                "recovery-observation case=generation-miss members={} retained={} round={} position={} arm={} iterations={iterations} raw_ns_per_observation={:.1} checksum={sum}",
-                ids.len(),
-                retained_flight_count(&fixture.binding),
-                round + 1,
-                position + 1,
-                if via_view {
-                    "stale-view-fallback"
-                } else {
-                    "fresh-batch"
-                },
-                elapsed.as_secs_f64() * 1e9 / iterations as f64
-            );
-        }
     }
 }

@@ -331,6 +331,53 @@ fn prepared_credit_frontier_preserves_fallback_wake_and_normal_later_recovery() 
 }
 
 #[test]
+fn prepared_recovery_keeps_suppression_deadline_without_debt_demand() {
+    let fixture = credit_frontier_fixture(8192, Duration::from_secs(10));
+    let lane = TrafficClass::Throughput;
+    let targets = fixture.binding.sender_path_targets(lane, 4096);
+    let identity = credit_frontier_target(&fixture.binding, 2);
+
+    let now = Instant::now();
+    let expected_deadline = fixture
+        .binding
+        .observe_prepared_copy_work(now, true)
+        .next_deadline;
+    let no_ready = fixture.sender.next_prepared_recovery(
+        &fixture.binding,
+        &fixture.stream,
+        &AuthoritativeStreamAckSnapshot::default(),
+        lane,
+        &targets,
+        &[],
+        now,
+    );
+    assert!(no_ready.candidate.is_none());
+    assert_eq!(no_ready.next_deadline, expected_deadline);
+
+    // Keep the binding's retained physical copies while presenting an empty
+    // logical send cache. Recovery has no source range, but the existing
+    // suppression deadline remains part of the returned wake behavior.
+    let empty_stream =
+        ReliableSendStream::new_with_initial_max_offset(StreamId(55), MuxLimits::default(), 8192);
+    let now = Instant::now();
+    let expected_deadline = fixture
+        .binding
+        .observe_prepared_copy_work(now, true)
+        .next_deadline;
+    let no_retained_range = fixture.sender.next_prepared_recovery(
+        &fixture.binding,
+        &empty_stream,
+        &AuthoritativeStreamAckSnapshot::default(),
+        lane,
+        &targets,
+        &[identity],
+        now,
+    );
+    assert!(no_retained_range.candidate.is_none());
+    assert_eq!(no_retained_range.next_deadline, expected_deadline);
+}
+
+#[test]
 fn prepared_recovery_accepts_disjoint_due_quanta_without_ack_and_stops_at_young_assignment() {
     let lane = TrafficClass::Throughput;
     let limits = MuxLimits::default();

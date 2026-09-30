@@ -335,7 +335,7 @@ impl ServerTcpPathSession {
                     }
                 }
                 ServerTcpPathEvent::Frame(frame) => {
-                    match self.handle_frame(frame).await? {
+                    match self.handle_ready_input(frame).await? {
                         ServerTcpFrameDisposition::Continue => {}
                         ServerTcpFrameDisposition::BeginPathDrain => {
                             return self.run_path_drain().await;
@@ -368,6 +368,49 @@ impl ServerTcpPathSession {
                 },
             }
         }
+    }
+
+    /// Service only the feedback prefix already queued when this input turn
+    /// starts. Original frames retain FIFO, validation and recipient ownership;
+    /// the first other frame is the existing writer/input ordering boundary.
+    async fn handle_ready_input(
+        &mut self,
+        frame: Frame,
+    ) -> Result<ServerTcpFrameDisposition, RuntimeError> {
+        let ready = if matches!(frame, Frame::StreamAck { .. } | Frame::StreamMaxData { .. }) {
+            self.path_frames.len()
+        } else {
+            0
+        };
+        let disposition = self.handle_frame(frame).await?;
+        if !matches!(disposition, ServerTcpFrameDisposition::Continue) {
+            return Ok(disposition);
+        }
+        for _ in 0..ready {
+            // A missing or closed Product may route synchronously without a
+            // channel poll. Such input must still respect cooperative service.
+            tokio::task::coop::consume_budget().await;
+            match self.path_frames.try_recv() {
+                Ok(Ok(frame @ (Frame::StreamAck { .. } | Frame::StreamMaxData { .. }))) => {
+                    let disposition = self.handle_frame(frame).await?;
+                    if !matches!(disposition, ServerTcpFrameDisposition::Continue) {
+                        return Ok(disposition);
+                    }
+                }
+                Ok(Ok(boundary)) => {
+                    self.deferred_input = Some(boundary);
+                    break;
+                }
+                Ok(Err(error)) if encrypted_framed_peer_closed(&error) => {
+                    return Ok(ServerTcpFrameDisposition::Stop);
+                }
+                Ok(Err(error)) => return Err(RuntimeError::Encrypted(error)),
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+        Ok(ServerTcpFrameDisposition::Continue)
     }
 
     async fn send_due_heartbeat(&mut self) -> Result<ServerTcpSessionDisposition, RuntimeError> {

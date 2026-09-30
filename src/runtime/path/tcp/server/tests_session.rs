@@ -2763,3 +2763,117 @@ async fn server_tcp_path_close_is_the_aggregate_responder_suffix() {
         "measurement work is canceled and PATH_CLOSE is serialized last"
     );
 }
+
+#[tokio::test]
+async fn server_tcp_ready_feedback_preserves_original_frames_and_open_boundary() {
+    use crate::protocol::OffsetRange;
+    use crate::runtime::path::{ServerStreamOpenRequest, ServerStreamPathAttachment};
+    use crate::runtime::stream::{ServerReliableStreamOpen, ServerReliableStreamRegistry};
+
+    let session_id = SessionId(410);
+    let path_id = PathId(0);
+    let stream_id = StreamId(1);
+    let (mut session, _client, commands, _frames, _relay) =
+        server_tcp_test_session(session_id, path_id).await;
+    let registry = Arc::new(ServerReliableStreamRegistry::new(4));
+    let port = registry.path_port();
+    let registration = port.register_test_carrier_path(
+        session_id,
+        UnderlayProtocol::Tcp,
+        path_id,
+        ServerLocalPathProperties::default(),
+    );
+    let mut accepted = match registry
+        .open_or_attach(ServerStreamOpenRequest {
+            session_id,
+            stream_id,
+            target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 80))),
+            initial_demand: StreamDemandHint::Throughput,
+            return_plan: Default::default(),
+            attachment: ServerStreamPathAttachment {
+                path_registration: registration.clone(),
+                commands,
+                max_frame_payload_bytes: session.context.mux_limits.max_payload_bytes,
+            },
+            mux_limits: session.context.mux_limits,
+        })
+        .unwrap()
+    {
+        ServerReliableStreamOpen::New(accepted, _) => accepted,
+        _ => panic!("new Product stream"),
+    };
+    let mut product_input = accepted.take_stream();
+    session.context.reliable_streams = port;
+    session.path_registration = registration;
+    let (frames, receiver) = mpsc::channel(4);
+    session.path_frames = receiver;
+
+    let first = Frame::StreamAck {
+        stream_id,
+        scope_start: None,
+        ranges: vec![OffsetRange { start: 0, end: 8 }],
+    };
+    let credit = Frame::StreamMaxData {
+        stream_id,
+        max_offset: 64,
+    };
+    let malformed = Frame::StreamAck {
+        stream_id,
+        scope_start: Some(4),
+        ranges: vec![OffsetRange { start: 8, end: 7 }],
+    };
+    let open = Frame::OpenStream {
+        stream_id: StreamId(2),
+        target: TargetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 81))),
+        demand: StreamDemandHint::Latency,
+        return_plan: Default::default(),
+    };
+    for frame in [&credit, &malformed, &open, &first] {
+        frames.try_send(Ok(frame.clone())).unwrap();
+    }
+    assert!(matches!(
+        session.handle_ready_input(first.clone()).await.unwrap(),
+        super::ServerTcpFrameDisposition::Continue,
+    ));
+    for expected in [&first, &credit, &malformed] {
+        assert_eq!(product_input.try_recv_frame().unwrap().unwrap(), *expected);
+    }
+    assert!(product_input.try_recv_frame().is_none());
+    assert_eq!(session.deferred_input, Some(open));
+    assert_eq!(session.path_frames.try_recv().unwrap().unwrap(), first);
+
+    // Start a turn with its exact Product recipient full. A new frame added
+    // while that first transfer waits must not extend the captured prefix.
+    let capacity = crate::runtime::path::commands::reliable_stream_frame_queue_for_payload(
+        session.context.mux_limits,
+        session.context.mux_limits.max_payload_bytes,
+    );
+    for _ in 0..capacity {
+        session
+            .context
+            .reliable_streams
+            .route_frame(&session.path_registration, stream_id, credit.clone())
+            .await
+            .unwrap();
+    }
+    session.deferred_input = None;
+    frames.try_send(Ok(credit.clone())).unwrap();
+    tokio::task::yield_now().await;
+    let mut service = Box::pin(session.handle_ready_input(first.clone()));
+    assert!(matches!(
+        futures::poll!(&mut service),
+        std::task::Poll::Pending
+    ));
+    frames.try_send(Ok(first.clone())).unwrap();
+    for _ in 0..capacity {
+        assert_eq!(product_input.try_recv_frame().unwrap().unwrap(), credit);
+    }
+    assert!(matches!(
+        service.await.unwrap(),
+        super::ServerTcpFrameDisposition::Continue
+    ));
+    assert_eq!(product_input.try_recv_frame().unwrap().unwrap(), first);
+    assert_eq!(product_input.try_recv_frame().unwrap().unwrap(), credit);
+    assert!(product_input.try_recv_frame().is_none());
+    assert_eq!(session.path_frames.try_recv().unwrap().unwrap(), first);
+}

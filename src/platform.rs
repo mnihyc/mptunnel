@@ -34,7 +34,7 @@ pub use config::{
     LinuxInterfaceNameError, LinuxPolicyConfig, LinuxPolicyConfigError, LinuxSocketMark,
     LinuxSocketMarkError, LinuxVpnConfig, ManagedVpnConfig, ManagedVpnConfigError, RouteMode,
 };
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "windows")]
 pub(crate) use desktop_routes::snapshot_process_vpn_environment_excluding_interface;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub use desktop_routes::{

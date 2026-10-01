@@ -34,7 +34,7 @@ pub use host_control::{
     RuntimeHostControl, RuntimeHostFlowStats, RuntimeHostIoStats, RuntimeHostPhase,
     RuntimeHostReadinessError, RuntimeHostStats,
 };
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
 pub(crate) use node::run_with_all_host_providers_and_control;
 pub(crate) use node::{
     RuntimeGenerationOutcome, run_with_all_host_providers_and_config_control,

@@ -164,7 +164,9 @@ jobs:
         if: matrix.kind == 'windows' || matrix.kind == 'unix'
         env:
           RUSTFLAGS: ${{ matrix.kind == 'windows' && '-C target-feature=+crt-static' || '' }}
-        run: cargo test --locked --all-features --target ${{ matrix.target }}
+        # Tests own their runtime concurrency. Separate live socket fixtures
+        # must not consume one another's real-time protocol deadlines.
+        run: cargo test --locked --all-features --target ${{ matrix.target }} -- --test-threads=1
 
       - name: Verify Unix package manifest and binary
         if: matrix.kind != 'windows'

@@ -108,13 +108,15 @@ jobs:
         if: matrix.kind == 'windows' || matrix.kind == 'unix'
         env:
           RUSTFLAGS: ${{ matrix.kind == 'windows' && '-C target-feature=+crt-static' || '' }}
-        run: cargo test --locked --all-features --target ${{ matrix.target }}
+        # Tests own their runtime concurrency. Separate live socket fixtures
+        # must not consume one another's real-time protocol deadlines.
+        run: cargo test --locked --all-features --target ${{ matrix.target }} -- --test-threads=1
 
       - name: Run native Tokio service regression tests
         if: matrix.kind == 'windows' || matrix.kind == 'unix'
         env:
           RUSTFLAGS: ${{ matrix.kind == 'windows' && '-C target-feature=+crt-static' || '' }}
-        run: cargo test --locked --manifest-path crates/tokio/Cargo.toml --features full,test-util --test rt_service_budget --target ${{ matrix.target }}
+        run: cargo test --locked --manifest-path crates/tokio/Cargo.toml --features full,test-util --test rt_service_budget --target ${{ matrix.target }} -- --test-threads=1
 
       - name: Verify Unix binary version
         if: matrix.kind != 'android' && matrix.kind != 'windows'

@@ -1,8 +1,10 @@
 use super::*;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use crate::product::{DnsOutboundCapabilitySpec, DnsSecurityPolicy, NetworkSet};
 use crate::product::{
-    DnsOutboundCapabilitySpec, DnsOverrideRecordId, DnsOverrideRecordSpec, DnsPlanSpec,
-    DnsPolicySpec, DnsRuleMatch, DnsRuleSpec, DnsSecurityPolicy, DnsSyntheticCaptureId,
-    DnsSyntheticCaptureSpec, DnsUpstreamSpec, DnsUpstreamStrategy, NetworkSet,
+    DnsOverrideRecordId, DnsOverrideRecordSpec, DnsPlanSpec, DnsPolicySpec, DnsRuleMatch,
+    DnsRuleSpec, DnsSyntheticCaptureId, DnsSyntheticCaptureSpec, DnsUpstreamSpec,
+    DnsUpstreamStrategy,
 };
 use hickory_proto::rr::rdata::{CNAME, TXT};
 use std::collections::VecDeque;

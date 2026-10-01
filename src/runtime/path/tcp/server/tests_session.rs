@@ -23,7 +23,9 @@ use crate::runtime::path::commands::{
     recv_reliable_path_command, reliable_path_command_channels,
     reliable_path_command_pending_bytes, try_recv_reliable_path_command,
 };
-use crate::runtime::path::tcp::heartbeat::{TcpCarrierHeartbeat, TcpCarrierHeartbeatFailure};
+use crate::runtime::path::tcp::heartbeat::TcpCarrierHeartbeat;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use crate::runtime::path::tcp::heartbeat::TcpCarrierHeartbeatFailure;
 use crate::runtime::path::{
     AcceptedServerDatagramFlow, PathProofObservation, ServerDatagramOpenError,
     ServerDatagramOpenRequest, ServerDatagramPort, ServerDatagramPortBackend,

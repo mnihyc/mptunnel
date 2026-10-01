@@ -76,18 +76,6 @@ fn fragmented_pending_gap_with(fragments: usize) -> PreparedCompletionFixture {
     fixture
 }
 
-struct ProjectionModeGuard(bool);
-impl ProjectionModeGuard {
-    fn new(uncached: bool) -> Self {
-        Self(RECOVERY_PROJECTION_UNCACHED.with(|mode| mode.replace(uncached)))
-    }
-}
-impl Drop for ProjectionModeGuard {
-    fn drop(&mut self) {
-        RECOVERY_PROJECTION_UNCACHED.with(|mode| mode.set(self.0));
-    }
-}
-
 #[tokio::test]
 async fn recovery_projection_count_is_bounded_by_captured_paths_not_gap_fragments() {
     let mut fixture = fragmented_pending_gap();
@@ -287,6 +275,18 @@ async fn recovery_projection_new_pass_observes_product_ack_and_new_native_captur
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn recovery_projection_complete_pass_cost_probe() {
+    struct ProjectionModeGuard(bool);
+    impl ProjectionModeGuard {
+        fn new(uncached: bool) -> Self {
+            Self(RECOVERY_PROJECTION_UNCACHED.with(|mode| mode.replace(uncached)))
+        }
+    }
+    impl Drop for ProjectionModeGuard {
+        fn drop(&mut self) {
+            RECOVERY_PROJECTION_UNCACHED.with(|mode| mode.set(self.0));
+        }
+    }
+
     fn thread_ns() -> u128 {
         let mut at = std::mem::MaybeUninit::<libc::timespec>::uninit();
         // SAFETY: valid writable timespec; success initializes both fields.

@@ -405,6 +405,7 @@ fn normalize_legacy_marker_lines(contents: &str) -> String {
     normalized
 }
 
+#[cfg(test)]
 fn mpp_outbound_index(document: &DocumentMut) -> Result<usize, AndroidBridgeError> {
     document
         .get("outbounds")

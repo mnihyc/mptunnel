@@ -250,7 +250,18 @@ async fn quic_initial_singleton_accepts_first_max_after_setup_allowance() {
     let accepted = fixture.establish_current().await;
     let mut events = observe_pending_opens(&fixture.session);
     let limits = fixture.server_context.codec_limits;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Freeze the setup allowance before launching the open. Native RTT can
+    // make it exceed ten seconds under contention. Leave the existing I/O
+    // guard on each side of the simulated advance inside the logical lifetime.
+    let setup = reliable_initial_open_timeout(
+        &fixture.context,
+        RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+        false,
+    );
+    let deadline = tokio::time::Instant::now() + setup + OPEN_OWNERSHIP_GUARD * 2;
     let opening = open_remote_stream_until(
         &fixture.context,
         TargetAddr::Ip(([127, 0, 0, 1], 80).into()),
@@ -271,16 +282,25 @@ async fn quic_initial_singleton_accepts_first_max_after_setup_allowance() {
     assert_eq!(plan.candidate_total, 1);
     assert_eq!(plan.candidate_ordinal, 0);
 
-    let setup = reliable_initial_open_timeout(
-        &fixture.context,
-        RelayPathKey {
-            underlay: UnderlayProtocol::Udp,
-            index,
-        },
-        false,
-    );
+    assert_eq!(index, 0);
+    // Peer receipt can precede completion of the local write future. Observe
+    // the sender's submission too before moving past its setup deadline.
+    let mut observed = Vec::new();
+    tokio::select! {
+        _ = observe_until(
+            &mut events,
+            stream_id,
+            ClientUdpPendingOpenEvent::Submitted,
+            &mut observed,
+        ) => {},
+        result = &mut opening => panic!(
+            "single-candidate open completed before submission: {:?}",
+            result.map(|_| ())
+        ),
+    }
     tokio::time::pause();
     tokio::time::advance(setup + Duration::from_millis(1)).await;
+    assert!(tokio::time::Instant::now() < deadline);
     assert!(
         opening.as_mut().now_or_never().is_none(),
         "a fully submitted final candidate remains live beyond its setup allowance"
@@ -355,7 +375,6 @@ async fn quic_initial_singleton_accepts_first_max_after_setup_allowance() {
     );
     repair_send.cancel_pending_response();
 
-    let mut observed = Vec::new();
     observe_until(
         &mut events,
         stream_id,
@@ -377,7 +396,18 @@ async fn quic_initial_singleton_reset_after_setup_allowance_is_not_swallowed() {
     let accepted = fixture.establish_current().await;
     let mut events = observe_pending_opens(&fixture.session);
     let limits = fixture.server_context.codec_limits;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Freeze the setup allowance before launching the open. Native RTT can
+    // make it exceed ten seconds under contention. Leave the existing I/O
+    // guard on each side of the simulated advance inside the logical lifetime.
+    let setup = reliable_initial_open_timeout(
+        &fixture.context,
+        RelayPathKey {
+            underlay: UnderlayProtocol::Udp,
+            index: 0,
+        },
+        false,
+    );
+    let deadline = tokio::time::Instant::now() + setup + OPEN_OWNERSHIP_GUARD * 2;
     let opening = open_remote_stream_until(
         &fixture.context,
         TargetAddr::Ip(([127, 0, 0, 1], 80).into()),
@@ -395,16 +425,25 @@ async fn quic_initial_singleton_reset_after_setup_allowance_is_not_swallowed() {
         .await
         .expect("single candidate submits its native CREATE/MAX");
     assert_eq!(plan.candidate_total, 1);
-    let setup = reliable_initial_open_timeout(
-        &fixture.context,
-        RelayPathKey {
-            underlay: UnderlayProtocol::Udp,
-            index,
-        },
-        false,
-    );
+    assert_eq!(index, 0);
+    // Peer receipt can precede completion of the local write future. Observe
+    // the sender's submission too before moving past its setup deadline.
+    let mut observed = Vec::new();
+    tokio::select! {
+        _ = observe_until(
+            &mut events,
+            stream_id,
+            ClientUdpPendingOpenEvent::Submitted,
+            &mut observed,
+        ) => {},
+        result = &mut opening => panic!(
+            "single-candidate open completed before submission: {:?}",
+            result.map(|_| ())
+        ),
+    }
     tokio::time::pause();
     tokio::time::advance(setup + Duration::from_millis(1)).await;
+    assert!(tokio::time::Instant::now() < deadline);
     assert!(
         opening.as_mut().now_or_never().is_none(),
         "the submitted request remains pending before its logical deadline"
@@ -437,7 +476,6 @@ async fn quic_initial_singleton_reset_after_setup_allowance_is_not_swallowed() {
     );
     assert_ordered_detach(&mut peer_recv, stream_id, limits).await;
     retire_unopened_peer_repair(&accepted, limits).await;
-    let mut observed = Vec::new();
     observe_until(
         &mut events,
         stream_id,

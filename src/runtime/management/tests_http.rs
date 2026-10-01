@@ -372,7 +372,7 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     assert!(DASHBOARD_JS.contains("function deliveryRateIsStale(path, ageMs, snapshotStale)"));
     assert!(DASHBOARD_JS.contains("deliveryRateIsStale(path, effectiveAgeMs, snapshotStale)"));
     assert!(DASHBOARD_JS.contains("Math.max(0, Date.now() - state.lastReceivedAt)"));
-    assert!(DASHBOARD_JS.contains("Math.max(0, Date.now() - state.peerResultReceivedAt)"));
+    assert!(DASHBOARD_JS.contains("Math.max(0, Date.now() - observation.observedAt)"));
     assert!(DASHBOARD_JS.contains("Math.max(0, generatedAt - receivedAt)"));
     assert!(!DASHBOARD_JS.contains("Math.max(0, Date.now() - receivedAt)"));
     assert!(DASHBOARD_JS.contains("finiteNumber(ageMs) >= finiteNumber(horizonMs)"));
@@ -472,8 +472,8 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
     }
     for raw_session_identity in [
         "JSON.stringify([session.service, session.service_index, session.service_name, session.session_id]",
-        "peerSessionKey(result) === peerSessionKey(session)",
-        "peerSessionKey(state.peerResult) === peerSessionKey(session)",
+        "peerSessionKey(result) !== key",
+        "state.peerDiagnostics.get(peerSessionKey(session))",
         "session_id: session.session_id",
     ] {
         assert!(

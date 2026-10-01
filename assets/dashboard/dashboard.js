@@ -15,6 +15,8 @@
   const DEFAULT_REFRESH_INTERVAL_MS = 5000;
   const DEFAULT_CHART_WINDOW_MS = 900000;
   const REQUEST_TIMEOUT_MS = 8000;
+  // Match the responder's per-session admission interval, measured after completion.
+  const PEER_REQUEST_MIN_INTERVAL_MS = 1000;
   const MIN_STALE_AFTER_MS = 6500;
   const QUALITY_PAYLOAD_BYTES = 64 * 1024;
   const LOCAL_PATH_SORT_COLUMNS = [
@@ -157,9 +159,7 @@
     authenticationRequired: false,
     lastReceivedAt: 0,
     lastError: null,
-    peerResult: null,
-    peerResultReceivedAt: 0,
-    peerResultsBySession: new Map(),
+    peerDiagnostics: new Map(),
     selectedPeerSessionKey: "",
     selectedTab: "overview",
     tableSorts: new Map(),
@@ -285,9 +285,8 @@
     state.tokenPersistencePending = false;
     state.authenticationGeneration += 1;
     state.authenticationRefreshPending = false;
-    state.peerResultsBySession.clear();
-    state.peerResult = null;
-    state.peerResultReceivedAt = 0;
+    state.peerDiagnostics.clear();
+    if (state.status) renderSelectedPeerResult();
     storeToken("");
     try {
       window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
@@ -759,18 +758,17 @@
   }
 
   function peerResultResidenceMs(result) {
-    const live = result && state.peerResultsBySession.get(peerSessionKey(result));
-    if (live && live.result === result && live.receivedAt > 0) {
-      return Math.max(0, Date.now() - live.receivedAt);
-    }
-    if (result && result === state.peerResult && state.peerResultReceivedAt > 0) {
-      return Math.max(0, Date.now() - state.peerResultReceivedAt);
+    const peer = result && state.peerDiagnostics.get(peerSessionKey(result));
+    const observation = peer && [peer.snapshot, peer.attempt].find(function (entry) {
+      return entry && entry.result === result;
+    });
+    if (observation) {
+      return observation.residenceAtReceipt + Math.max(0, Date.now() - observation.observedAt);
     }
     const generatedAt = finiteNumber(asObject(state.status).generated_unix_ms);
     const receivedAt = finiteNumber(asObject(result).received_unix_ms);
     const residenceAtSnapshot = generatedAt > 0 && receivedAt > 0
-      ? Math.max(0, generatedAt - receivedAt)
-      : 0;
+      ? Math.max(0, generatedAt - receivedAt) : 0;
     return residenceAtSnapshot + statusResidenceMs();
   }
 
@@ -812,36 +810,57 @@
       .join("\u001f");
   }
 
-  function pathQualities(paths, result, tableKey) {
-    const previous = state.nativeDeliveryCursors.get(tableKey) || new Map();
+  function nativeDeliveryKey(path, result) {
+    return [qualityGroupKey(path, result), path.underlay, path.path_id, path.path_instance_id].join("\u001f");
+  }
+
+  function sampleNativeDelivery(paths, result, previous, observedAt) {
     const current = new Map();
+    paths.forEach(function (pathValue) {
+      const path = asObject(pathValue);
+      const key = nativeDeliveryKey(path, result);
+      const sample = path.native_delivery;
+      if (!sample) return;
+      const bytes = BigInt(sample.acked_bytes);
+      const at = BigInt(sample.sampled_at_us);
+      const old = previous.get(key);
+      const sameEpoch = old && old.epoch === sample.epoch && old.direction === sample.direction;
+      let point;
+      if (sameEpoch && at === old.at && bytes === old.bytes) {
+        point = old; // Repeated observations cannot create an interval or renew its age.
+      } else {
+        const continuous = sameEpoch && at > old.at && bytes >= old.bytes;
+        const delta = continuous ? bytes - old.bytes : null;
+        const elapsedMs = continuous ? Number(at - old.at) / 1000 : null;
+        point = {
+          epoch: sample.epoch, direction: sample.direction, bytes: bytes, at: at,
+          delta: delta, elapsedMs: elapsedMs, observedAt: observedAt,
+          rate: continuous ? Number(delta) * 8000 / elapsedMs : null
+        };
+      }
+      current.set(key, point);
+    });
+    return current;
+  }
+
+  function pathQualities(paths, result, tableKey) {
     const now = Date.now();
+    let current;
+    if (result) {
+      const peer = state.peerDiagnostics.get(peerSessionKey(result));
+      // Peer measurements belong to accepted observations, never to a table render.
+      current = peer && peer.snapshot && peer.snapshot.result === result
+        ? peer.snapshot.points : new Map();
+    } else {
+      current = sampleNativeDelivery(paths, null, state.nativeDeliveryCursors.get(tableKey) || new Map(), now);
+      state.nativeDeliveryCursors.set(tableKey, current);
+    }
     const snapshotStale = (result ? peerResultResidenceMs(result) : statusResidenceMs()) >= staleAfterMs();
     const qualities = paths.map(function (pathValue) {
       const path = asObject(pathValue);
       const group = qualityGroupKey(path, result);
-      const key = [group, path.underlay, path.path_id, path.path_instance_id].join("\u001f");
       const sample = path.native_delivery;
-      let point = null;
-      if (sample) {
-        const bytes = BigInt(sample.acked_bytes);
-        const at = BigInt(sample.sampled_at_us);
-        const old = previous.get(key);
-        const sameEpoch = old && old.epoch === sample.epoch && old.direction === sample.direction;
-        if (sameEpoch && at === old.at && bytes === old.bytes) {
-          point = old; // Redraw/poll repetition cannot create a new interval.
-        } else {
-          const continuous = sameEpoch && at > old.at && bytes >= old.bytes;
-          const delta = continuous ? bytes - old.bytes : null;
-          const elapsedMs = continuous ? Number(at - old.at) / 1000 : null;
-          point = {
-            epoch: sample.epoch, direction: sample.direction, bytes: bytes, at: at,
-            delta: delta, elapsedMs: elapsedMs, observedAt: now,
-            rate: continuous ? Number(delta) * 8000 / elapsedMs : null
-          };
-        }
-        current.set(key, point);
-      }
+      const point = current.get(nativeDeliveryKey(path, result)) || null;
       const approximateRate = path.delivery_rate_approximate === true;
       const rate = point ? point.rate : (
         approximateRate && metricAvailable(path.delivery_rate_bps)
@@ -873,8 +892,6 @@
         coverageFresh: 0, coverageTotal: 0
       };
     });
-    // Retain only the currently displayed carrier identities, not hopping history.
-    state.nativeDeliveryCursors.set(tableKey, current);
     const groups = new Map();
     qualities.forEach(function (quality) {
       const group = groups.get(quality.group) || { totalRate: 0, freshCount: 0, totalCount: 0 };
@@ -1269,10 +1286,12 @@
         state.authenticationRefreshPending = Boolean(state.bearerToken);
         return false;
       }
+      const previousStartedAt = asObject(state.status).started_unix_ms;
       state.status = validateStatus(responses[0]);
       mergeChartSamples(asArray(asObject(state.status.traffic).trends));
       state.health = validateHealth(responses[1]);
       state.lastReceivedAt = Date.now();
+      reconcilePeerDiagnostics(previousStartedAt);
       state.lastError = null;
       state.authenticationRequired = false;
       if (state.tokenPersistencePending) {
@@ -2378,29 +2397,69 @@
       .find(function (session) { return peerSessionKey(session) === state.selectedPeerSessionKey; }) || null;
   }
 
+  function ingestPeerResult(result, observedAt, residenceAtReceipt) {
+    const peer = state.peerDiagnostics.get(peerSessionKey(result));
+    if (!peer) return false; // The authenticated session has retired.
+    if (peer.attempt) {
+      // Request IDs are wrapping u64 counters, not wall-clock timestamps.
+      const distance = BigInt.asUintN(64,
+        BigInt(result.request_id) - BigInt(peer.attempt.result.request_id));
+      if (distance === 0n || distance >= (1n << 63n)) return false;
+    }
+    const observation = { result: result, observedAt: observedAt, residenceAtReceipt: residenceAtReceipt };
+    if (result.code === "ok") {
+      observation.points = sampleNativeDelivery(asArray(result.paths), result,
+        peer.snapshot ? peer.snapshot.points : new Map(), observedAt - residenceAtReceipt);
+      peer.snapshot = observation; // A successful empty inventory also retires old paths.
+    } else if (result.code === "disabled") {
+      peer.snapshot = null;
+    }
+    peer.attempt = observation;
+    peer.error = null;
+    return true;
+  }
+
+  function reconcilePeerDiagnostics(previousStartedAt) {
+    if (previousStartedAt !== undefined && previousStartedAt !== state.status.started_unix_ms) {
+      state.peerDiagnostics.clear();
+    }
+    const diagnostics = asObject(state.status.diagnostics);
+    const live = new Set(asArray(diagnostics.peer_sessions).map(peerSessionKey));
+    state.peerDiagnostics.forEach(function (_peer, key) {
+      if (!live.has(key)) state.peerDiagnostics.delete(key);
+    });
+    live.forEach(function (key) {
+      if (!state.peerDiagnostics.has(key)) {
+        state.peerDiagnostics.set(key, { snapshot: null, attempt: null, error: null, nextRequestAt: 0 });
+      }
+    });
+    asArray(diagnostics.peer_results).forEach(function (result) {
+      const generatedAt = finiteNumber(state.status.generated_unix_ms);
+      const receivedAt = finiteNumber(result.received_unix_ms);
+      ingestPeerResult(result, state.lastReceivedAt, Math.max(0, generatedAt - receivedAt));
+    });
+  }
+
   function newestCachedPeerResult(session) {
-    if (!session) return null;
-    const results = asArray(asObject(state.status.diagnostics).peer_results)
-      .filter(function (result) {
-        return peerSessionKey(result) === peerSessionKey(session);
-      })
-      .sort(function (left, right) { return finiteNumber(right.received_unix_ms) - finiteNumber(left.received_unix_ms); });
-    const cached = results[0] || null;
-    const live = state.peerResultsBySession.get(peerSessionKey(session));
-    const explicit = state.peerResult && peerSessionKey(state.peerResult) === peerSessionKey(session)
-      ? state.peerResult
-      : null;
-    return [cached, live && live.result, explicit].filter(Boolean).reduce(function (newest, candidate) {
-      return !newest || finiteNumber(candidate.received_unix_ms) >= finiteNumber(newest.received_unix_ms)
-        ? candidate
-        : newest;
-    }, null);
+    const peer = session && state.peerDiagnostics.get(peerSessionKey(session));
+    const observation = peer && (peer.snapshot || peer.attempt);
+    return observation ? observation.result : null;
+  }
+
+  function peerRefreshFailure(peer) {
+    if (!peer) return null;
+    if (peer.error) return "Refresh failed";
+    return peer.attempt && peer.attempt !== peer.snapshot
+      ? "Refresh " + titleCase(peer.attempt.result.code) : null;
   }
 
   function renderSelectedPeerResult() {
     const selectedSession = selectedPeerSession();
     const result = newestCachedPeerResult(selectedSession);
     renderPeerResult(result);
+    const peer = selectedSession && state.peerDiagnostics.get(peerSessionKey(selectedSession));
+    const failure = peerRefreshFailure(peer);
+    if (result && failure) appendMetric(elements.peerResultSummary, "Latest refresh", peer.error || failure);
     renderOverviewPeerResult();
   }
 
@@ -2533,6 +2592,7 @@
     const paths = result ? asArray(result.paths) : [];
     body.replaceChildren();
     empty.hidden = paths.length !== 0;
+    if (!result) return;
     sortedPathEntries(paths, result, tableKey, peerPathSortValue).forEach(function (entry) {
       appendPeerPathRow(body, entry.path, result, entry.quality);
     });
@@ -2546,87 +2606,34 @@
   }
 
   function overviewPeerOutboundGroups() {
-    // Diagnostics index only MPP client contexts. Filtering this inventory first
-    // keeps the fallback ordinal aligned even when native outbounds are interleaved.
+    // Only MPP contexts contribute diagnostics indices, even with interleaved
+    // direct outbounds. Every configured MPP outbound retains its own table.
     const configured = asArray(state.status.outbounds)
       .map(asObject)
       .filter(function (outbound) { return String(outbound.protocol || "") === "mpp"; });
-    const diagnostics = asObject(state.status.diagnostics);
-    const allSessions = asArray(diagnostics.peer_sessions).map(asObject);
-    const sessions = allSessions
-      .filter(function (session) { return String(session.service || "") === "mpp_outbound"; });
-    const results = asArray(diagnostics.peer_results)
-      .map(asObject)
-      .filter(function (result) { return String(result.service || "") === "mpp_outbound"; });
-    const activeSessionKeys = new Set(allSessions.map(peerSessionKey));
-    state.peerResultsBySession.forEach(function (_entry, key) {
-      if (!activeSessionKeys.has(key)) state.peerResultsBySession.delete(key);
-    });
-    const groups = configured.map(function (outbound, serviceIndex) {
+    const sessions = asArray(asObject(state.status.diagnostics).peer_sessions).map(asObject);
+    return configured.map(function (outbound, serviceIndex) {
       const name = String(outbound.name || "");
-      return {
+      const group = {
         key: name || "mpp_outbound:" + serviceIndex,
         name: name || "MPP outbound " + serviceIndex,
         outboundName: name,
         serviceIndex: serviceIndex,
-        sessions: [],
-        results: []
+        sessions: []
       };
-    });
-
-    function groupFor(item) {
-      return groups.find(function (group) { return peerOutboundMatches(item, group); }) || null;
-    }
-
-    sessions.forEach(function (session) {
-      const group = groupFor(session);
-      if (group && !group.sessions.some(function (entry) {
-        return peerSessionKey(entry) === peerSessionKey(session);
-      })) {
-        group.sessions.push(session);
-      }
-    });
-    results.forEach(function (result) {
-      const group = groupFor(result);
-      if (!group || !group.sessions.some(function (session) {
-        return peerSessionKey(session) === peerSessionKey(result);
-      })) return;
-      const existing = group.results.find(function (entry) {
-        return peerSessionKey(entry) === peerSessionKey(result);
+      sessions.forEach(function (session) {
+        if (peerOutboundMatches(session, group) && !group.sessions.some(function (entry) {
+          return peerSessionKey(entry) === peerSessionKey(session);
+        })) group.sessions.push(session);
       });
-      if (!existing || finiteNumber(result.received_unix_ms) > finiteNumber(existing.received_unix_ms)) {
-        if (existing) group.results.splice(group.results.indexOf(existing), 1);
-        group.results.push(result);
-      }
-    });
-    state.peerResultsBySession.forEach(function (entry) {
-      const result = entry.result;
-      const group = groupFor(result);
-      if (!group || !group.sessions.some(function (session) {
-        return peerSessionKey(session) === peerSessionKey(result);
-      })) return;
-      const existing = group.results.find(function (item) {
-        return peerSessionKey(item) === peerSessionKey(result);
+      group.peers = group.sessions.map(function (session) {
+        return {
+          session: session, result: newestCachedPeerResult(session),
+          diagnostic: state.peerDiagnostics.get(peerSessionKey(session))
+        };
       });
-      if (!existing || finiteNumber(result.received_unix_ms) >= finiteNumber(existing.received_unix_ms)) {
-        if (existing) group.results.splice(group.results.indexOf(existing), 1);
-        group.results.push(result);
-      }
+      return group;
     });
-
-    groups.forEach(function (group) {
-      const peers = new Map();
-      group.sessions.forEach(function (session) {
-        peers.set(peerSessionKey(session), { session: session, result: null });
-      });
-      group.results.forEach(function (result) {
-        const key = peerSessionKey(result);
-        const peer = peers.get(key);
-        if (peer) peer.result = result;
-      });
-      group.peers = Array.from(peers.values());
-    });
-    return groups;
   }
 
   function renderOverviewPeerResult() {
@@ -2635,7 +2642,6 @@
     let sampleCount = 0;
     let failedCount = 0;
     const activeGroupKeys = new Set();
-    const activePeerQualityKeys = new Set();
     elements.overviewPeerPathsList.replaceChildren();
 
     groups.forEach(function (group, groupIndex) {
@@ -2665,9 +2671,8 @@
       const peers = group.peers;
       const peerResults = peers.filter(function (peer) { return peer.result !== null; });
       const resultsForContext = peerResults.map(function (peer) { return peer.result; });
-      const groupFailedCount = peerResults.filter(function (peer) {
-        return String(peer.result.code) !== "ok";
-      }).length;
+      const failedPeers = peers.filter(function (peer) { return peerRefreshFailure(peer.diagnostic); });
+      const groupFailedCount = failedPeers.length;
       connectedCount += group.sessions.length;
       sampleCount += peerResults.length;
       failedCount += groupFailedCount;
@@ -2690,6 +2695,9 @@
           contextParts.push(peerResults.length + "/" + group.sessions.length + " sampled");
         }
       }
+      if (failedPeers.some(function (peer) { return peer.diagnostic.snapshot; })) {
+        contextParts.push("last successful sample retained");
+      }
       context.textContent = contextParts.join(" · ");
 
       const allResultsOk = peerResults.length > 0 && groupFailedCount === 0;
@@ -2700,6 +2708,13 @@
       if (peerResults.length === 0) stateBadge.textContent = "No sample";
       else if (peerResults.length === 1) stateBadge.textContent = titleCase(peerResults[0].result.code);
       else stateBadge.textContent = peerResults.length + " samples";
+      if (groupFailedCount > 0) {
+        stateBadge.textContent = peers.length === 1
+          ? peerRefreshFailure(failedPeers[0].diagnostic) : groupFailedCount + " refreshes failed";
+      }
+      stateBadge.title = failedPeers.map(function (peer) {
+        return peer.diagnostic.error || peerRefreshFailure(peer.diagnostic);
+      }).join("; ");
 
       let pathCount = 0;
       const entries = [];
@@ -2708,7 +2723,6 @@
         const peerResult = peer.result;
         if (!peerResult) return;
         const qualityTableKey = peerTableKey + ":quality:" + String(peer.session.session_id);
-        activePeerQualityKeys.add(qualityTableKey);
         entries.push.apply(
           entries,
           sortedPathEntries(asArray(peerResult.paths), peerResult, qualityTableKey, peerPathSortValue)
@@ -2747,14 +2761,6 @@
       overviewPeerGroupNodes.delete(key);
       state.tableSorts.delete(tableKey);
     });
-    Array.from(state.nativeDeliveryCursors.keys()).forEach(function (tableKey) {
-      if (
-        String(tableKey).startsWith("overview-peer-outbound:") &&
-        !activePeerQualityKeys.has(tableKey)
-      ) {
-        state.nativeDeliveryCursors.delete(tableKey);
-      }
-    });
 
     elements.overviewPeerPathsEmpty.hidden = groups.length !== 0;
     if (groups.length === 0) {
@@ -2764,10 +2770,17 @@
       return;
     }
 
+    const retainedAfterFailure = groups.some(function (group) {
+      return group.peers.some(function (peer) {
+        return peerRefreshFailure(peer.diagnostic) && peer.diagnostic.snapshot;
+      });
+    });
     elements.overviewPeerContext.textContent =
       formatCount(groups.length) + " configured MPP outbounds · " +
       formatCount(connectedCount) + " connected sessions · " +
-      formatCount(sampleCount) + " peer samples";
+      formatCount(sampleCount) + " peer samples" +
+      (failedCount > 0 ? " · " + failedCount + " refreshes failed" : "") +
+      (retainedAfterFailure ? "; last successful samples retained" : "");
     const allConnectedSampled = connectedCount > 0 && sampleCount === connectedCount && failedCount === 0;
     const someSampled = sampleCount > 0;
     elements.overviewPeerState.className = "badge " + (
@@ -2775,6 +2788,9 @@
     );
     elements.overviewPeerState.textContent = connectedCount === 0
       ? "No connected peers"
+      : failedCount > 0 ? (connectedCount === 1
+        ? peerRefreshFailure(groups.flatMap(function (group) { return group.peers; })[0].diagnostic)
+        : failedCount + " refreshes failed")
       : sampleCount + "/" + connectedCount + " sampled";
   }
 
@@ -2801,26 +2817,39 @@
   }
 
   async function requestPeerStatusForSession(session) {
+    const key = peerSessionKey(session);
+    const peer = state.peerDiagnostics.get(key);
+    if (!peer || performance.now() < peer.nextRequestAt) return null;
     const authenticationGeneration = state.authenticationGeneration;
+    // Object identity also fences retirement/restart followed by the same key.
+    const current = function () {
+      return authenticationGeneration === state.authenticationGeneration && state.peerDiagnostics.get(key) === peer;
+    };
     const payload = {
       service: session.service,
       service_name: session.service_name,
       session_id: session.session_id
     };
-    const result = await requestJson(PEER_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    if (authenticationGeneration !== state.authenticationGeneration) return null;
-    if (peerSessionKey(result) !== peerSessionKey(session)) {
-      throw new Error("Peer diagnostics returned a different outbound session");
+    try {
+      const result = await requestJson(PEER_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!current()) return null;
+      if (peerSessionKey(result) !== key) {
+        throw new Error("Peer diagnostics response does not match the requested outbound session");
+      }
+      ingestPeerResult(result, Date.now(), 0);
+      return result;
+    } catch (error) {
+      if (!current()) return null;
+      peer.error = error && error.message ? error.message : "Peer diagnostics request failed";
+      throw error;
+    } finally {
+      // Completion-based spacing also covers slow replies and failed requests.
+      if (current()) peer.nextRequestAt = performance.now() + PEER_REQUEST_MIN_INTERVAL_MS;
     }
-    const receivedAt = Date.now();
-    state.peerResultsBySession.set(peerSessionKey(session), { result: result, receivedAt: receivedAt });
-    state.peerResult = result;
-    state.peerResultReceivedAt = receivedAt;
-    return result;
   }
 
   async function requestPeerStatuses(source, coordinated) {
@@ -2842,12 +2871,12 @@
     let received = 0;
     let failed = 0;
     try {
-      // Keep one diagnostics request in flight at a time; every current MPP session gets a fresh request.
+      // Requests remain serialized; each live session owns its own cooldown.
       for (const session of uniqueSessions) {
         if (state.authenticationRequired || authenticationGeneration !== state.authenticationGeneration) break;
         try {
           const result = await requestPeerStatusForSession(session);
-          if (!result) break;
+          if (!result) continue;
           received += 1;
           renderSelectedPeerResult();
         } catch (error) {
@@ -2859,7 +2888,8 @@
         }
       }
       elements.peerRequestState.className = failed > 0 ? "inline-status is-error" : "inline-status";
-      elements.peerRequestState.textContent = received + "/" + uniqueSessions.length + " outbound peer sessions refreshed";
+      elements.peerRequestState.textContent = received + "/" + uniqueSessions.length + " outbound peer sessions refreshed" +
+        (received === 0 && failed === 0 ? "; current sample retained" : "");
       if (source === "manual") announce(elements.peerRequestState.textContent);
     } finally {
       state.peerFetching = false;
@@ -2881,7 +2911,13 @@
     const authenticationGeneration = state.authenticationGeneration;
     try {
       const result = await requestPeerStatusForSession(session);
-      if (!result) return;
+      if (!result) {
+        if (authenticationGeneration === state.authenticationGeneration) {
+          elements.peerRequestState.className = "inline-status";
+          elements.peerRequestState.textContent = "Current peer sample retained";
+        }
+        return;
+      }
       elements.peerRequestState.className = "inline-status";
       elements.peerRequestState.textContent = "Peer response received " +
         formatResidenceRelative(peerResultResidenceMs(result));
@@ -3546,9 +3582,8 @@
       state.authenticationGeneration += 1;
       state.authenticationRefreshPending = true;
       state.authenticationRequired = false;
-      state.peerResultsBySession.clear();
-      state.peerResult = null;
-      state.peerResultReceivedAt = 0;
+      state.peerDiagnostics.clear();
+      if (state.status) renderSelectedPeerResult();
       closeAuthDialog();
       runPendingAuthenticationRefresh();
     });

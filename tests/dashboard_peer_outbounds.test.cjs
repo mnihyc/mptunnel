@@ -60,30 +60,26 @@ function extractFunction(name) {
   throw new Error(`unterminated function ${name}`);
 }
 
-function peerKey(session) {
-  return JSON.stringify([session.service, session.service_index, session.service_name, session.session_id]
-    .map(value => value === undefined || value === null ? "" : String(value)));
+function peerContext(status, liveResults = []) {
+  const context = vm.createContext({ state: {
+    status, lastReceivedAt: 1, peerDiagnostics: new Map()
+  } });
+  const names = ["asArray", "asObject", "finiteNumber", "peerSessionKey", "qualityGroupKey",
+    "nativeDeliveryKey", "sampleNativeDelivery", "ingestPeerResult", "reconcilePeerDiagnostics",
+    "newestCachedPeerResult", "peerOutboundMatches", "overviewPeerOutboundGroups"];
+  vm.runInContext(names.map(extractFunction).join("\n"), context);
+  context.reconcilePeerDiagnostics(undefined);
+  for (const { result } of liveResults) context.ingestPeerResult(result, 1, 0);
+  return context;
 }
 
 function groupedOutbounds(status, liveResults = []) {
-  const context = vm.createContext({ state: {
-    status,
-    peerResultsBySession: new Map(liveResults.map(({ session, result }) => [peerKey(session), { result, receivedAt: 1 }]))
-  } });
-  const names = ["asArray", "asObject", "finiteNumber", "peerSessionKey", "peerOutboundMatches", "overviewPeerOutboundGroups"];
-  vm.runInContext(names.map(extractFunction).join("\n"), context);
-  return JSON.parse(JSON.stringify(context.overviewPeerOutboundGroups()));
+  return JSON.parse(JSON.stringify(peerContext(status, liveResults).overviewPeerOutboundGroups()));
 }
 
-function selectedPeerResult(status, session, live, explicit) {
-  const context = vm.createContext({ state: {
-    status,
-    peerResultsBySession: new Map(live ? [[peerKey(session), { result: live, receivedAt: 1 }]] : []),
-    peerResult: explicit || null
-  } });
-  const names = ["asArray", "asObject", "finiteNumber", "peerSessionKey", "newestCachedPeerResult"];
-  vm.runInContext(names.map(extractFunction).join("\n"), context);
-  return JSON.parse(JSON.stringify(context.newestCachedPeerResult(session)));
+function selectedPeerResult(status, session, live) {
+  return JSON.parse(JSON.stringify(peerContext(status, live ? [{ result: live }] : [])
+    .newestCachedPeerResult(session)));
 }
 
 test("peer paths group by MPP name and MPP context index across interleaved native outbounds", () => {
@@ -104,10 +100,10 @@ test("peer paths group by MPP name and MPP context index across interleaved nati
         { service: "mpp_inbound", service_index: 0, service_name: "server-inbound", session_id: "inbound-a", carrier_count: 1 }
       ],
       peer_results: [
-        { service: "mpp_outbound", service_index: 0, service_name: north, session_id: "north-a", received_unix_ms: 10, paths: [] },
-        { service: "mpp_outbound", service_index: 0, service_name: north, session_id: "north-b", received_unix_ms: 20, paths: [] },
-        { service: "mpp_outbound", service_index: 1, session_id: "south-a", received_unix_ms: 30, paths: [] },
-        { service: "mpp_inbound", service_index: 0, service_name: "server-inbound", session_id: "inbound-a", received_unix_ms: 40, paths: [] }
+        { service: "mpp_outbound", service_index: 0, service_name: north, session_id: "north-a", received_unix_ms: 10, code: "ok", request_id: "1", paths: [] },
+        { service: "mpp_outbound", service_index: 0, service_name: north, session_id: "north-b", received_unix_ms: 20, code: "ok", request_id: "2", paths: [] },
+        { service: "mpp_outbound", service_index: 1, session_id: "south-a", received_unix_ms: 30, code: "ok", request_id: "3", paths: [] },
+        { service: "mpp_inbound", service_index: 0, service_name: "server-inbound", session_id: "inbound-a", received_unix_ms: 40, code: "ok", request_id: "4", paths: [] }
       ]
     }
   };
@@ -138,7 +134,7 @@ test("inbound-only peers do not create outbound tables", () => {
 test("empty or stale session results cannot invent a peer row, while a live exact-key result wins", () => {
   const session = { service: "mpp_outbound", service_index: 0, service_name: "north", session_id: "101" };
   const stale = { ...session, session_id: "removed", received_unix_ms: 90, paths: [{ path: "stale" }] };
-  const fresh = { ...session, received_unix_ms: 100, request_id: "fresh", paths: [{ path: "fresh" }] };
+  const fresh = { ...session, received_unix_ms: 100, request_id: "1", code: "ok", paths: [{ path: "fresh" }] };
   const status = {
     outbounds: [{ name: "north", protocol: "mpp" }],
     diagnostics: { peer_sessions: [session], peer_results: [stale] }
@@ -149,17 +145,17 @@ test("empty or stale session results cannot invent a peer row, while a live exac
 
   const [withLive] = groupedOutbounds(status, [{ session, result: fresh }]);
   assert.equal(withLive.peers.length, 1);
-  assert.equal(withLive.peers[0].result.request_id, "fresh", "fresh queried result overrides status cache");
+  assert.equal(withLive.peers[0].result.request_id, "1", "fresh queried result overrides status cache");
 
   const newerCacheStatus = structuredClone(status);
   newerCacheStatus.diagnostics.peer_results = [{
     ...session,
     received_unix_ms: 120,
-    request_id: "newer-cache",
+    request_id: "2", code: "ok",
     paths: [{ path: "newer-cache" }]
   }];
   const [withNewerCache] = groupedOutbounds(newerCacheStatus, [{ session, result: fresh }]);
-  assert.equal(withNewerCache.peers[0].result.request_id, "newer-cache", "newer same-key status result wins over old live cache");
+  assert.equal(withNewerCache.peers[0].result.request_id, "2", "newer same-key status result wins over old live cache");
 
   const [withWrongIdentity] = groupedOutbounds(status, [{
     session,
@@ -167,6 +163,6 @@ test("empty or stale session results cannot invent a peer row, while a live exac
   }]);
   assert.equal(withWrongIdentity.peers[0].result, null, "same session ID on a different outbound cannot leak across groups");
 
-  const selected = selectedPeerResult(newerCacheStatus, session, fresh, fresh);
-  assert.equal(selected.request_id, "newer-cache", "selected diagnostics view also uses the newest exact-key result");
+  const selected = selectedPeerResult(newerCacheStatus, session, fresh);
+  assert.equal(selected.request_id, "2", "selected diagnostics view also uses the newest exact-key result");
 });

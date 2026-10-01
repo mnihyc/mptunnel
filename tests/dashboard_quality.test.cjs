@@ -65,9 +65,7 @@ function makeHarness() {
   const state = {
     nativeDeliveryCursors: new Map(),
     refreshIntervalMs: 5_000,
-    peerResult: null,
-    peerResultReceivedAt: 0,
-    peerResultsBySession: new Map(),
+    peerDiagnostics: new Map(),
     lastReceivedAt: 0,
     status: {}
   };
@@ -89,6 +87,8 @@ function makeHarness() {
     "metricIsStale",
     "deliveryRateIsStale",
     "qualityGroupKey",
+    "nativeDeliveryKey",
+    "sampleNativeDelivery",
     "pathQualities",
     "staleAfterMs"
   ];
@@ -98,8 +98,15 @@ function makeHarness() {
     state,
     run(paths, result, tableKey = "quality-test", receivedAtMs = clock.ms) {
       if (result) {
-        state.peerResult = result;
-        state.peerResultReceivedAt = receivedAtMs;
+        if (receivedAtMs > 0) {
+          const key = context.peerSessionKey(result);
+          const old = state.peerDiagnostics.get(key);
+          state.peerDiagnostics.set(key, { snapshot: {
+            result, observedAt: receivedAtMs, residenceAtReceipt: 0,
+            points: context.sampleNativeDelivery(paths, result,
+              old ? old.snapshot.points : new Map(), clock.ms)
+          } });
+        }
       } else {
         state.lastReceivedAt = clock.ms;
       }

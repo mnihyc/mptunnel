@@ -1361,7 +1361,17 @@ async fn handle_disconnected_client_tcp_command(
             tokio::pin!(connect);
             let connect_result = tokio::select! {
                 biased;
-                _ = response.closed() => return,
+                _ = response.closed() => {
+                    // The caller waits on this same absolute deadline. If it
+                    // expires first, dropping its receiver is a timed-out
+                    // establishment, not an early cancellation. Commit through
+                    // the ordinary failure path so health and probe observers
+                    // cannot depend on which task the executor polls first.
+                    if tokio::time::Instant::now() < open_deadline {
+                        return;
+                    }
+                    Err(RuntimeError::PathOpenTimedOut)
+                }
                 result = &mut connect => result,
             };
             match connect_result {
@@ -2372,3 +2382,7 @@ mod tests {
         assert_eq!(metrics.confidence_ppm, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "tests_probe_timeout.rs"]
+mod probe_timeout_tests;

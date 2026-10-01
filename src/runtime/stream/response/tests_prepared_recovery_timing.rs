@@ -24,8 +24,8 @@ fn prepared_recovery_clock_survives_sparse_ack_and_later_rtt_growth() {
         end: 2048,
     }]);
     let mut slower = snapshot;
-    slower.srtt_ms = 5_000.0;
-    slower.jitter_ms = 1_000.0;
+    slower.set_rtt_for_test(5_000.0);
+    slower.set_rttvar_for_test(1_000.0);
     let (fragment, boundary) = binding
         .observe_prepared_recovery_timing(
             OffsetRange {

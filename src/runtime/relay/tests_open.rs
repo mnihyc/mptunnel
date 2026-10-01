@@ -369,7 +369,7 @@ fn cold_quic_attachment_budget_covers_serialized_setup_exchanges() {
     let snapshot = context.reliable_path_snapshot(key);
     let timeouts = reliable_relay_attach_open_timeouts(&context, key);
 
-    assert_eq!(timeouts.live, transport_pto_from_snapshot(snapshot));
+    assert_eq!(timeouts.live, peer_pto_from_snapshot(snapshot));
     assert_eq!(
         timeouts.setup,
         path_open_pto(snapshot, true).saturating_mul(path_open_serialized_exchanges(snapshot)),

@@ -1896,6 +1896,7 @@ fn committed_response_copy_deadline_is_not_recomputed_from_later_path_timing() {
         .checked_sub(committed_target_interval)
         .expect("committed deadline retains its accepted-copy epoch");
     binding.set_output_product_model_for_test(owner, 200_000_000.0, 5_000.0);
+    binding.set_output_peer_timing_for_test(owner, 5_000.0, 625.0);
     let later_owner_interval = crate::model::timing::reliable_data_retransmission_interval(
         Some(owner.underlay),
         binding.response_output_snapshot(owner_identity, TrafficClass::Throughput),

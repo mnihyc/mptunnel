@@ -7,7 +7,6 @@ use super::tcp_session::TcpDatagramClientSession;
 use crate::model::capacity::{DATAGRAM_FEEDBACK_DELAY_BUDGET, TRANSPORT_TIMER_GRANULARITY};
 use crate::model::timing::{
     path_open_pto, path_open_pto_multiplier, path_open_serialized_exchanges,
-    transport_pto_from_snapshot,
 };
 use crate::protocol::{DatagramFlowId, DatagramId};
 use crate::runtime::error::RuntimeError;
@@ -236,10 +235,11 @@ pub(in crate::runtime) fn tcp_datagram_response_timeout(
     if ttl.is_zero() {
         return ttl;
     }
-    let initial_response_pto = transport_pto_from_snapshot(Some(snapshot));
+    let timing = snapshot.peer_timing();
+    let initial_response_pto = timing.pto();
     let srtt = response_srtt.unwrap_or(initial_response_pto);
     let rttvar = response_rttvar.unwrap_or_else(|| {
-        Duration::from_secs_f64((snapshot.jitter_ms.max(snapshot.srtt_ms.max(1.0) / 8.0)) / 1000.0)
+        Duration::from_secs_f64((timing.rttvar_ms().max(timing.srtt_ms().max(1.0) / 8.0)) / 1000.0)
     });
     let loss_gain = 1.0 + snapshot.loss_rate.clamp(0.0, 1.0);
     (srtt + rttvar.mul_f64(4.0) + DATAGRAM_FEEDBACK_DELAY_BUDGET)

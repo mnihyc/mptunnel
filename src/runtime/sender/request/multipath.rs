@@ -47,7 +47,6 @@ use crate::model::request_evidence::{
 };
 use crate::model::timing::{
     ReliableDataAckGapTiming, reliable_data_retransmission_interval, reliable_path_stale_interval,
-    transport_rate_sample_freshness_horizon,
 };
 use crate::model::work::{
     RangeRecoveryState, ReliableLiveOwnerFrontier, ReliableReinjectionTargetWork,
@@ -1277,8 +1276,12 @@ impl RequestMultipathController {
             };
             if let Some(snapshot) = path.shared_snapshot.as_mut() {
                 if !shape.srtt().is_zero() {
-                    snapshot.srtt_ms = shape.srtt().as_secs_f64() * 1_000.0;
-                    snapshot.jitter_ms = shape.rttvar().as_secs_f64() * 1_000.0;
+                    snapshot.set_timing(crate::model::timing::PathTiming::quic(
+                        crate::model::timing::TransportTiming::new(
+                            shape.srtt().as_secs_f64() * 1_000.0,
+                            shape.rttvar().as_secs_f64() * 1_000.0,
+                        ),
+                    ));
                 }
                 snapshot.bytes_in_flight = shape.bytes_in_flight();
                 snapshot.carrier_inflight_limit_bytes = shape
@@ -2518,8 +2521,12 @@ impl RequestMultipathController {
         let mut snapshot =
             self.request_reinjection_target_snapshot_from_observation(&observation, instance)?;
         if !shape.srtt().is_zero() {
-            snapshot.srtt_ms = shape.srtt().as_secs_f64() * 1_000.0;
-            snapshot.jitter_ms = shape.rttvar().as_secs_f64() * 1_000.0;
+            snapshot.set_timing(crate::model::timing::PathTiming::quic(
+                crate::model::timing::TransportTiming::new(
+                    shape.srtt().as_secs_f64() * 1_000.0,
+                    shape.rttvar().as_secs_f64() * 1_000.0,
+                ),
+            ));
         }
         snapshot.bytes_in_flight = shape.bytes_in_flight();
         snapshot.carrier_inflight_limit_bytes = shape
@@ -2838,12 +2845,12 @@ impl RequestMultipathController {
         context: &ClientPathContext,
         instance: RelayPathInstance,
     ) -> Option<Duration> {
-        let snapshot = context.reliable_path_snapshot_for_instance(instance)?;
-        let srtt = Duration::from_secs_f64(snapshot.srtt_ms.max(1.0) / 1000.0);
-        let rttvar = Duration::from_secs_f64(
-            snapshot.jitter_ms.max(snapshot.srtt_ms / 8.0).max(0.001) / 1000.0,
-        );
-        Some(transport_rate_sample_freshness_horizon(srtt, rttvar))
+        Some(
+            context
+                .reliable_path_snapshot_for_instance(instance)?
+                .peer_timing()
+                .rate_freshness_horizon(),
+        )
     }
 
     fn prepare_relay_path_decision(

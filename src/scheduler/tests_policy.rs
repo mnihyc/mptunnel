@@ -1,4 +1,5 @@
 use super::*;
+use crate::protocol::{PathId, UnderlayProtocol};
 
 fn mbps(value: f64) -> f64 {
     value * 1_000_000.0
@@ -10,7 +11,10 @@ fn heterogeneous_links_send_interactive_to_low_latency_path() {
     let high_bandwidth = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, mbps(300.0));
     let mut unstable = PathSnapshot::new(PathId(2), UnderlayProtocol::Udp, 80.0, mbps(100.0));
     unstable.loss_rate = 0.08;
-    unstable.jitter_ms = 30.0;
+    unstable.set_timing(crate::model::timing::PathTiming::startup(
+        unstable.peer_timing().srtt_ms(),
+        30.0,
+    ));
 
     let choice = choose_path(
         &[low_latency, high_bandwidth, unstable],
@@ -45,7 +49,10 @@ fn heterogeneous_links_send_large_bulk_to_high_bandwidth_path() {
     let high_bandwidth = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 180.0, mbps(300.0));
     let mut unstable = PathSnapshot::new(PathId(2), UnderlayProtocol::Udp, 80.0, mbps(100.0));
     unstable.loss_rate = 0.08;
-    unstable.jitter_ms = 30.0;
+    unstable.set_timing(crate::model::timing::PathTiming::startup(
+        unstable.peer_timing().srtt_ms(),
+        30.0,
+    ));
 
     let choice = choose_path(
         &[low_latency, high_bandwidth, unstable],
@@ -80,7 +87,7 @@ fn throughput_scoring_does_not_divide_per_flow_goodput_again() {
     measured.pacing_rate_bps = mbps(600.0);
 
     assert_eq!(
-        effective_path_rate_bps(measured, TrafficClass::Throughput),
+        policy::effective_path_rate_bps(measured.completion(), TrafficClass::Throughput),
         mbps(200.0)
     );
 }
@@ -92,7 +99,7 @@ fn completion_scoring_does_not_treat_raw_pacing_as_delivered_capacity() {
     measured.pacing_rate_bps = mbps(1_000.0);
 
     assert_eq!(
-        effective_path_rate_bps(measured, TrafficClass::Throughput),
+        policy::effective_path_rate_bps(measured.completion(), TrafficClass::Throughput),
         mbps(50.0)
     );
 }
@@ -206,4 +213,39 @@ fn material_completion_advantage_uses_eta_beyond_timing_uncertainty() {
         ),
         "reducing the available raw queue cannot reverse a still-material ETA disadvantage",
     );
+}
+
+#[test]
+fn split_tcp_completion_uses_peer_timing_without_rewriting_transport_shape() {
+    let mut slow = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 0.1, mbps(100.0));
+    let mut fast = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 20.0, mbps(100.0));
+    slow.set_timing(crate::model::timing::PathTiming::tcp(
+        slow.transport_timing(),
+        crate::model::timing::PeerTiming::new(160.0, 0.0),
+    ));
+    fast.set_timing(crate::model::timing::PathTiming::tcp(
+        fast.transport_timing(),
+        crate::model::timing::PeerTiming::new(20.0, 0.0),
+    ));
+    let native_timing = slow.transport_timing();
+    for lane in [
+        TrafficClass::Control,
+        TrafficClass::Latency,
+        TrafficClass::Throughput,
+        TrafficClass::RealtimeDatagram,
+    ] {
+        assert_eq!(
+            choose_path(&[slow, fast], lane, 64 * 1024).unwrap().path_id,
+            fast.id
+        );
+    }
+    assert_eq!(slow.transport_timing().srtt_ms(), 0.1);
+    assert_eq!(slow.transport_timing(), native_timing);
+    assert!(!path_has_material_completion_advantage(79.0, slow, 80.0, {
+        fast.set_timing(crate::model::timing::PathTiming::tcp(
+            fast.transport_timing(),
+            crate::model::timing::PeerTiming::new(20.0, 2.0),
+        ));
+        fast
+    }));
 }

@@ -949,7 +949,7 @@ advisory observations and are not reclassified from numeric zero. Native carrier
 Product goodput, MPP feedback, configured-prior, and scheduler-default values
 are labeled by source and rate scope. On client-local rows, a native pacing
 value is shown only when the carrier actually supplied one;
-scheduler-normalized delivery is not called native pacing. A path's Rate cell
+scheduler-normalized delivery is not called native pacing. A path's Transport rate cell
 shows interval native ACK delivery first (`↑` C→S or `↓` S→C), its retained
 bandwidth estimate as `E`, and literal native pacing as `P`. Native acknowledged
 bytes include transport accounting overhead and are not unique Product bytes.
@@ -959,7 +959,7 @@ plan, current throughput or the capacity of the complete application route.
 The summary's Path estimates is a sum of observed estimates, not aggregate
 capacity: paths can share bottlenecks.
 
-Quality is a best-effort share of fresh observed delivery rates in the same
+ACK share is a best-effort share of fresh observed transport ACK rates in the same
 session and sender direction. Stale or missing rates are excluded independently:
 fresh paths still show their share among the fresh observations, with the measured
 coverage in the tooltip. A stale path keeps its historical sample marked `~`, but
@@ -983,7 +983,13 @@ Retained estimates and pacing values remain visible after their three-PTO freshn
 prefixed with `~`; effective sample age includes time the management snapshot
 has resided in the browser. RTT, loss, queue, flight, and other instantaneous
 snapshot fields use API-result residence instead of the age of the most recent
-delivery sample. Evidence sample counts and bytes belong to that same sender
+delivery sample. Last peer RTT instead retains the timestamp and source of the
+last authenticated same-carrier readiness, PathProof, or heartbeat exchange,
+plus browser residence. It includes protocol service and queueing, not target
+latency. Native TCP RTT can end at a terminating relay and is displayed
+separately. A prior is not an observed peer RTT; absent evidence remains
+unobserved, including legacy remote peer reports. RTT variation describes its
+estimator, not one-way packet jitter. Evidence sample counts and bytes belong to that same sender
 direction and rate epoch; they are not bidirectional forwarding totals. A
 download therefore contributes server-to-client sender evidence, not the
 client's client-to-server path record. Path usage direction and metric
@@ -1092,7 +1098,11 @@ transmission modes and not desired memory occupancy.
 | `quic_path_idle_timeout_s` | 30 s |
 
 Each heartbeat/keep-alive interval is a maximum idle delay, renewed within
-80%--100% of that interval. Both TCP endpoints independently monitor received
+80%--100% of that interval. TCP also uses that cadence for an authenticated peer
+round-trip sample during traffic; the server starts with a readiness-time probe.
+Peer timing includes carrier queueing and protocol service, not application
+target work. Samples expire for scheduling after interval plus timeout; native
+TCP updates cannot refresh them. Both TCP endpoints independently monitor received
 authenticated activity on each carrier. Local writes and traffic on another
 carrier do not keep it alive. A TCP heartbeat has one fixed send-and-reply budget,
 including waiting for a busy writer; other traffic cannot extend an outstanding

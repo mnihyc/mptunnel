@@ -6,7 +6,7 @@
 #[cfg(test)]
 use crate::model::capacity::reliable_stream_advertised_window_bytes;
 use crate::model::capacity::{QUIC_TIMER_GRANULARITY, reliable_stream_ack_update_bytes};
-use crate::model::timing::transport_pto_from_snapshot;
+use crate::model::timing::peer_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::mux::stream::ReliableRecvStream;
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
@@ -362,7 +362,7 @@ pub(in crate::runtime) fn reliable_relay_recv_progress_resend_active(
 pub(in crate::runtime) fn reliable_stream_recv_progress_interval(
     path: Option<PathSnapshot>,
 ) -> Duration {
-    transport_pto_from_snapshot(path)
+    peer_pto_from_snapshot(path)
         .div_f64(2.0)
         .max(QUIC_TIMER_GRANULARITY)
 }

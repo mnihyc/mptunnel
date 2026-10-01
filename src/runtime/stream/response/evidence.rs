@@ -253,6 +253,28 @@ impl ResponseStreamBinding {
     }
 
     #[cfg(test)]
+    pub(in crate::runtime) fn set_output_peer_timing_for_test(
+        &self,
+        key: CarrierPathKey,
+        srtt_ms: f64,
+        rttvar_ms: f64,
+    ) {
+        let mut outputs = self
+            .outputs
+            .lock()
+            .expect("server reliable stream binding lock");
+        let entry = outputs
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == key)
+            .expect("test output");
+        entry.commands = entry.commands.clone().with_peer_timing(
+            crate::runtime::path::peer_round_trip::PeerRoundTrip::for_test(srtt_ms, rttvar_ms)
+                .reader(),
+        );
+    }
+
+    #[cfg(test)]
     pub(in crate::runtime) fn set_output_product_model_for_test(
         &self,
         key: CarrierPathKey,

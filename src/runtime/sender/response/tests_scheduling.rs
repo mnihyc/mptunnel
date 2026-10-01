@@ -230,16 +230,16 @@ fn t04b_response_product_headroom_is_not_revoked_by_adverse_completion_inference
     let mut favorable = response_target(1, UnderlayProtocol::Udp, 20.0, 0, 16 * 1024 * 1024, false);
     favorable.observation.snapshot.delivery_rate_bps = 500_000_000.0;
     favorable.observation.snapshot.pacing_rate_bps = 500_000_000.0;
-    favorable.observation.snapshot.jitter_ms = 1.0;
+    favorable.observation.snapshot.set_rttvar_for_test(1.0);
     favorable.observation.snapshot.loss_rate = 0.0;
     favorable.observation.snapshot.confidence = 1.0;
     favorable.observation.snapshot.active_flows = 1;
 
     let mut adverse = favorable.clone();
-    adverse.observation.snapshot.srtt_ms = 800.0;
+    adverse.observation.snapshot.set_rtt_for_test(800.0);
     adverse.observation.snapshot.delivery_rate_bps = 1_000_000.0;
     adverse.observation.snapshot.pacing_rate_bps = 1_000_000.0;
-    adverse.observation.snapshot.jitter_ms = 200.0;
+    adverse.observation.snapshot.set_rttvar_for_test(200.0);
     adverse.observation.snapshot.loss_rate = 0.20;
     adverse.observation.snapshot.confidence = 0.05;
     adverse.observation.snapshot.active_flows = 64;
@@ -1283,7 +1283,7 @@ fn unmeasured_path_uses_completion_ranking_without_losing_bounded_liveness() {
     );
 
     let mut faster_unmeasured = unmeasured.clone();
-    faster_unmeasured.observation.snapshot.srtt_ms = 1.0;
+    faster_unmeasured.observation.snapshot.set_rtt_for_test(1.0);
     faster_unmeasured.observation.snapshot.delivery_rate_bps = 1_000_000_000.0;
     faster_unmeasured.observation.snapshot.pacing_rate_bps = 1_000_000_000.0;
     assert_eq!(
@@ -1899,9 +1899,9 @@ fn exact_lower_flight_owner_continues_within_measured_hysteresis() {
         16 * 1024 * 1024,
         true,
     );
-    owner.observation.snapshot.jitter_ms = 3.0;
+    owner.observation.snapshot.set_rttvar_for_test(3.0);
     let mut challenger = response_target(1, UnderlayProtocol::Tcp, 9.0, 0, 16 * 1024 * 1024, false);
-    challenger.observation.snapshot.jitter_ms = 3.0;
+    challenger.observation.snapshot.set_rttvar_for_test(3.0);
     let lower = [CarrierPathFlightDebt {
         key: owner.observation.key,
         output_incarnation: owner.observation.incarnation,
@@ -1933,9 +1933,9 @@ fn response_owner_hysteresis_does_not_activate_unused_quic_credit() {
         16 * 1024 * 1024,
         true,
     );
-    owner.observation.snapshot.jitter_ms = 3.0;
+    owner.observation.snapshot.set_rttvar_for_test(3.0);
     let mut underfed = response_target(1, UnderlayProtocol::Udp, 103.0, 0, 16 * 1024 * 1024, false);
-    underfed.observation.snapshot.jitter_ms = 3.0;
+    underfed.observation.snapshot.set_rttvar_for_test(3.0);
     underfed.observation.snapshot.app_limited = true;
     let lower = [CarrierPathFlightDebt {
         key: owner.observation.key,
@@ -1959,7 +1959,8 @@ fn response_owner_hysteresis_does_not_activate_unused_quic_credit() {
     .eta_ms;
     assert!(
         underfed_eta > owner_eta
-            && underfed_eta <= owner_eta + owner.observation.snapshot.jitter_ms,
+            && underfed_eta
+                <= owner_eta + owner.observation.snapshot.transport_timing().rttvar_ms(),
         "the fixture must keep acquisition inside measured completion uncertainty",
     );
     assert_eq!(
@@ -1992,10 +1993,10 @@ fn tcp_delivery_sample_app_limited_flag_does_not_preempt_response_owner() {
         16 * 1024 * 1024,
         true,
     );
-    owner.observation.snapshot.jitter_ms = 3.0;
+    owner.observation.snapshot.set_rttvar_for_test(3.0);
     let mut sampled_tcp =
         response_target(1, UnderlayProtocol::Tcp, 103.0, 0, 16 * 1024 * 1024, false);
-    sampled_tcp.observation.snapshot.jitter_ms = 3.0;
+    sampled_tcp.observation.snapshot.set_rttvar_for_test(3.0);
     sampled_tcp.observation.snapshot.app_limited = true;
     let lower = [CarrierPathFlightDebt {
         key: owner.observation.key,
@@ -2018,12 +2019,12 @@ fn materially_slower_underfed_native_credit_cannot_preempt_the_live_frontier() {
             UnderlayProtocol::Udp => UnderlayProtocol::Tcp,
         };
         let mut owner = response_target(0, owner_underlay, 80.0, 64 * 1024, 16 * 1024 * 1024, true);
-        owner.observation.snapshot.jitter_ms = 20.0;
+        owner.observation.snapshot.set_rttvar_for_test(20.0);
         owner.observation.snapshot.delivery_rate_bps = 555_000_000.0;
         owner.observation.snapshot.pacing_rate_bps = 555_000_000.0;
 
         let mut underfed = response_target(1, underlay, 100.0, 0, 16 * 1024 * 1024, false);
-        underfed.observation.snapshot.jitter_ms = 20.0;
+        underfed.observation.snapshot.set_rttvar_for_test(20.0);
         underfed.observation.snapshot.delivery_rate_bps = 351_000.0;
         underfed.observation.snapshot.pacing_rate_bps = 351_000.0;
         underfed.observation.snapshot.app_limited = true;
@@ -2049,7 +2050,7 @@ fn materially_slower_underfed_native_credit_cannot_preempt_the_live_frontier() {
         .expect("underfed score")
         .eta_ms;
         assert!(
-            underfed_eta > owner_eta + owner.observation.snapshot.jitter_ms,
+            underfed_eta > owner_eta + owner.observation.snapshot.transport_timing().rttvar_ms(),
             "the fixture must reproduce a materially later underfed carrier: owner={owner_eta:.3} ms underfed={underfed_eta:.3} ms",
         );
         assert_eq!(
@@ -2070,9 +2071,9 @@ fn material_completion_gain_preempts_lower_flight_owner_hysteresis() {
         16 * 1024 * 1024,
         true,
     );
-    owner.observation.snapshot.jitter_ms = 3.0;
+    owner.observation.snapshot.set_rttvar_for_test(3.0);
     let mut challenger = response_target(1, UnderlayProtocol::Tcp, 9.0, 0, 16 * 1024 * 1024, false);
-    challenger.observation.snapshot.jitter_ms = 3.0;
+    challenger.observation.snapshot.set_rttvar_for_test(3.0);
     let lower = [CarrierPathFlightDebt {
         key: owner.observation.key,
         output_incarnation: owner.observation.incarnation,
@@ -2096,10 +2097,10 @@ fn queue_growth_beyond_one_quantum_preempts_lower_flight_owner_hysteresis() {
         16 * 1024 * 1024,
         true,
     );
-    owner.observation.snapshot.jitter_ms = 100.0;
+    owner.observation.snapshot.set_rttvar_for_test(100.0);
     owner.observation.snapshot.queue_bytes = 2 * 64 * 1024;
     let mut challenger = response_target(1, UnderlayProtocol::Tcp, 9.0, 0, 16 * 1024 * 1024, false);
-    challenger.observation.snapshot.jitter_ms = 100.0;
+    challenger.observation.snapshot.set_rttvar_for_test(100.0);
     let lower = [CarrierPathFlightDebt {
         key: owner.observation.key,
         output_incarnation: owner.observation.incarnation,

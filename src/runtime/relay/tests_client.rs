@@ -287,8 +287,8 @@ async fn authoritative_request_gap_clipped_successor_keeps_original_owner_exclud
     );
     assert_eq!(owner_snapshot.delivery_rate_bps, 200_000_000.0);
     assert_eq!(target_snapshot.delivery_rate_bps, 200_000_000.0);
-    assert_eq!(owner_snapshot.srtt_ms, 20.0);
-    assert_eq!(target_snapshot.srtt_ms, 100.0);
+    assert_eq!(owner_snapshot.transport_timing().srtt_ms(), 20.0);
+    assert_eq!(target_snapshot.transport_timing().srtt_ms(), 100.0);
     let owner_score = crate::scheduler::score_path(owner_snapshot, lane, q).unwrap();
     let target_score = crate::scheduler::score_path(target_snapshot, lane, q).unwrap();
     // Keep a failing reachability predicate outside Product ownership so test

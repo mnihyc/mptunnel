@@ -9,7 +9,7 @@ use super::capacity::{
     reliable_capacity_measurement_session_limit_bytes, reliable_path_startup_sample_limit_bytes,
 };
 use super::request_evidence::RequestProductRateEpoch;
-use super::timing::transport_pto_from_snapshot;
+use super::timing::peer_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::protocol::UnderlayProtocol;
 use crate::scheduler::PathSnapshot;
@@ -63,7 +63,8 @@ pub(crate) fn request_tcp_capacity_measurement_geometry(
     let timing_slack_bytes = CAPACITY_TIMING_SLACK_BYTES;
     let candidate_carrier_flight_bytes = candidate.bytes_in_flight;
     let competing_rate_bdp =
-        (reference_model.rate_bps / 8.0 * candidate.srtt_ms.max(1.0) / 1_000.0).ceil() as u64;
+        (reference_model.rate_bps / 8.0 * candidate.peer_timing().srtt_ms().max(1.0) / 1_000.0)
+            .ceil() as u64;
     let competing_rate_pipe =
         ((competing_rate_bdp as f64) * RELIABLE_PIPE_WINDOW_BDPS).ceil() as u64;
     // A larger configured/startup cwnd is not native evidence. The exact flight
@@ -123,7 +124,7 @@ pub(crate) fn request_tcp_capacity_measurement_lease(
     train_bytes: u64,
     reference_rate_bps: u64,
 ) -> Duration {
-    let pto = transport_pto_from_snapshot(Some(candidate));
+    let pto = peer_pto_from_snapshot(Some(candidate));
     // Ordinary loss can delay any cold congestion-growth round. Budget each
     // modeled round with the candidate PTO instead of assuming lossless
     // SRTT-paced doubling; this remains a deadline, so success finishes early.

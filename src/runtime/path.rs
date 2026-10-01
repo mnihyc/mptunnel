@@ -17,6 +17,7 @@ mod initial_open;
 pub(in crate::runtime) mod input;
 pub(super) mod model;
 pub(in crate::runtime) mod native_commitment;
+pub(in crate::runtime) mod peer_round_trip;
 mod ports;
 pub(in crate::runtime) mod prepared;
 pub(super) mod proof;

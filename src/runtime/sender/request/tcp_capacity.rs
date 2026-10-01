@@ -17,7 +17,7 @@ use crate::model::request_capacity::{
 #[cfg(test)]
 use crate::model::request_evidence::RequestProductRateEpoch;
 #[cfg(test)]
-use crate::model::timing::transport_pto_from_snapshot;
+use crate::model::timing::peer_pto_from_snapshot;
 #[cfg(test)]
 use crate::model::work::ReliableWorkClass;
 #[cfg(test)]
@@ -342,7 +342,7 @@ impl RequestTcpCapacityController {
                 NEXT_REQUEST_TCP_CAPACITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let ticket = CapacityProbeCommandTicket::new();
             let now = Instant::now();
-            let baseline_budget = transport_pto_from_snapshot(Some(candidate_snapshot));
+            let baseline_budget = peer_pto_from_snapshot(Some(candidate_snapshot));
             let lease_duration = request_tcp_capacity_measurement_lease(
                 candidate_snapshot,
                 train_payload_bytes,
@@ -427,8 +427,8 @@ impl RequestTcpCapacityController {
                     geometry.warmup_carrier_bytes,
                     geometry.required_timed_carrier_bytes,
                     geometry.candidate_carrier_flight_bytes,
-                    candidate_snapshot.srtt_ms,
-                    candidate_snapshot.jitter_ms,
+                    candidate_snapshot.transport_timing().srtt_ms(),
+                    candidate_snapshot.transport_timing().rttvar_ms(),
                     geometry.reference_rate_bps as f64 / 1_000_000.0,
                     reference_model.delivery_samples,
                     baseline_budget.as_millis(),

@@ -596,8 +596,18 @@ fn server_native_shape_attachment_inherits_and_identical_fanout_is_quiet() {
         inherited.observation.snapshot.carrier_delivery_rate_bps,
         Some(80_000_000.0),
     );
-    assert_eq!(inherited.observation.snapshot.srtt_ms, 40.0);
-    assert_eq!(inherited.observation.snapshot.jitter_ms, 4.0);
+    assert_eq!(
+        inherited.observation.snapshot.transport_timing().srtt_ms(),
+        40.0
+    );
+    assert_eq!(
+        inherited
+            .observation
+            .snapshot
+            .transport_timing()
+            .rttvar_ms(),
+        4.0
+    );
     assert_eq!(
         inherited.observation.snapshot.carrier_inflight_limit_bytes,
         256_000,
@@ -1420,6 +1430,8 @@ fn repeated_session_retirement_resweeps_an_exact_late_path_instance() {
         paths.instances.insert(
             server_physical_path_key(identity),
             ServerRegisteredPath {
+                peer_round_trip: None,
+                peer_timing: None,
                 webhook: None,
                 native_delivery: None,
                 configured_slot: ConfiguredMemberSlot(identity.path_id.0),
@@ -2754,8 +2766,9 @@ fn late_open_and_closed_output_replacement_inherit_path_evidence() {
     assert!(inherited.observation.has_path_proof_evidence);
     assert_eq!(inherited.observation.snapshot.confidence, 1.0);
     assert_eq!(
-        inherited.observation.snapshot.srtt_ms, 12.0,
-        "validation RTT is a fallback without replacing native capacity evidence",
+        inherited.observation.snapshot.transport_timing().srtt_ms(),
+        20.0,
+        "path proof cannot overwrite the native timing tuple inherited by a QUIC output",
     );
     assert_eq!(
         inherited.observation.snapshot.peer_usage,
@@ -3024,6 +3037,8 @@ fn peer_status_snapshot_is_session_scoped_and_tracks_registration_lifetime() {
         .insert(
             server_physical_path_key(stale_identity),
             ServerRegisteredPath {
+                peer_round_trip: None,
+                peer_timing: None,
                 webhook: None,
                 native_delivery: None,
                 configured_slot: ConfiguredMemberSlot(stale_identity.path_id.0),

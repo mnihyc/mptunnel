@@ -19,7 +19,7 @@ use super::remote::{
 use crate::lab_diagnostics::lab_diagnostic;
 use crate::model::capacity::{QUIC_PERSISTENT_CONGESTION_THRESHOLD, reliable_relay_buffer_len};
 use crate::model::path::{CarrierPathInstanceId, RelayPathInstance, RelayPathKey};
-use crate::model::timing::transport_pto_from_snapshot;
+use crate::model::timing::peer_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::protocol::{Frame, StreamId, UnderlayProtocol};
@@ -990,7 +990,7 @@ pub(super) fn spawn_reliable_relay_disconnected_path_open(
 }
 
 pub(super) fn reliable_relay_disconnected_retry_delay() -> std::time::Duration {
-    transport_pto_from_snapshot(None)
+    peer_pto_from_snapshot(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1281,7 +1281,7 @@ pub(in crate::runtime) fn reliable_relay_receive_hole_reinjection_deadline(
     } else {
         last_receive_hole_reinjection_at
     };
-    tokio::time::Instant::from_std(anchor + transport_pto_from_snapshot(path))
+    tokio::time::Instant::from_std(anchor + peer_pto_from_snapshot(path))
 }
 
 pub(in crate::runtime) fn reliable_relay_product_stall_preserves_attached_path_set(
@@ -1310,7 +1310,7 @@ pub(in crate::runtime) fn reliable_relay_stall_deadline(
     last_progress_at: Instant,
     path: Option<PathSnapshot>,
 ) -> tokio::time::Instant {
-    tokio::time::Instant::from_std(last_progress_at + transport_pto_from_snapshot(path))
+    tokio::time::Instant::from_std(last_progress_at + peer_pto_from_snapshot(path))
 }
 
 pub(in crate::runtime) fn reliable_relay_product_stall_deadline(
@@ -1318,7 +1318,7 @@ pub(in crate::runtime) fn reliable_relay_product_stall_deadline(
     last_attempt_at: Option<Instant>,
     path: Option<PathSnapshot>,
 ) -> tokio::time::Instant {
-    let stall_timeout = transport_pto_from_snapshot(path);
+    let stall_timeout = peer_pto_from_snapshot(path);
     match last_attempt_at.filter(|attempt| *attempt >= last_progress_at) {
         Some(last_attempt_at) => tokio::time::Instant::from_std(
             last_attempt_at + stall_timeout.saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD),

@@ -337,8 +337,8 @@
       <section class="data-section data-section--wide" aria-labelledby="overview-paths-title">
         <div class="data-section__header data-section__header--actions">
           <div>
-            <h2 id="overview-paths-title">Path health and capacity</h2>
-            <p class="section-meta">Live transport metrics, ownership, and configured TCP carrier bounds. ~ = stale; * = platform-derived.</p>
+            <h2 id="overview-paths-title">Path observations</h2>
+            <p class="section-meta">Last peer round trip is a timed MPP exchange. Transport metrics describe the local transport, not an intermediate proxy’s onward path. ~ = stale; * = platform-derived.</p>
           </div>
           <span id="overview-paths-count" class="badge badge--neutral">0 paths</span>
         </div>
@@ -351,10 +351,10 @@
                 <th scope="col" title="Service name / service kind / MPP session (16-hex)">Service</th>
                 <th scope="col" title="Carrier / TCP member and pool size">Carrier</th>
                 <th scope="col" title="Path usage and its traffic direction / policy">Use</th>
-                <th scope="col" title="Round-trip time / jitter / evidence source">Latency</th>
-                <th scope="col" title="Delivery rate / native pacing when observed / independent metric direction / provenance / scope">Rate</th>
-                <th scope="col" title="Loss / ECN">Loss</th>
-                <th scope="col" title="Observed delivery-rate share / unloaded 64 KiB completion ETA">Quality</th>
+                <th scope="col" title="Last authenticated MPP peer round trip, independent sample age, and separate transport/model RTT">Last peer RTT</th>
+                <th scope="col" title="Delivery rate / native pacing when observed / independent metric direction / provenance / scope">Transport rate</th>
+                <th scope="col" title="Loss / ECN">Transport loss</th>
+                <th scope="col" title="Transport ACK-rate share / 64 KiB serialization only; not capacity or end-to-end completion time">ACK share</th>
                 <th scope="col" title="Queue / native carrier flight / MPP data flight / native limit">Flight</th>
                 <th scope="col" title="Sender-direction confidence / samples / bytes / effective age and freshness window / native, Product, ACK and app-limited flags">Evidence</th>
                 <th scope="col" title="Active flows / latency-sensitive flows">Flows</th>
@@ -413,10 +413,10 @@
                     <th scope="col" title="Locally configured path / endpoint / peer Path ID / metric epoch / active observed hopping port">Path</th>
                     <th scope="col" title="Carrier">Carrier</th>
                     <th scope="col" title="Path usage and its traffic direction">Use</th>
-                    <th scope="col" title="Round-trip time / RTT variation / jitter / peer-advisory source">Latency</th>
-                    <th scope="col" title="Peer-advisory delivery and pacing / independent metric direction / provenance / scope">Rate</th>
-                    <th scope="col" title="Loss / ECN">Loss</th>
-                    <th scope="col" title="Peer-observed delivery-rate share / unloaded 64 KiB completion ETA">Quality</th>
+                    <th scope="col" title="Peer round trip is unavailable in legacy peer reports; reported transport/model RTT remains separate">Last peer RTT</th>
+                    <th scope="col" title="Peer-advisory delivery and pacing / independent metric direction / provenance / scope">Transport rate</th>
+                    <th scope="col" title="Loss / ECN">Transport loss</th>
+                    <th scope="col" title="Peer-observed transport ACK-rate share / 64 KiB serialization only; not capacity or end-to-end completion time">ACK share</th>
                     <th scope="col" title="Queue / native carrier flight / native limit">Flight</th>
                     <th scope="col" title="Sender-direction confidence / samples / bytes / wire age plus cached residence / freshness window / observation flags">Evidence</th>
                   </tr>
@@ -618,10 +618,10 @@
                 <th scope="col" title="Service name / service kind / MPP session (16-hex)">Service</th>
                 <th scope="col" title="Carrier / TCP member and pool size">Carrier</th>
                 <th scope="col" title="Path usage and its traffic direction / policy">Use</th>
-                <th scope="col" title="Round-trip time / jitter / evidence source">Latency</th>
-                <th scope="col" title="Delivery rate / native pacing when observed / independent metric direction / provenance / scope">Rate</th>
-                <th scope="col" title="Loss / ECN">Loss</th>
-                <th scope="col" title="Observed delivery-rate share / unloaded 64 KiB completion ETA">Quality</th>
+                <th scope="col" title="Last authenticated MPP peer round trip, independent sample age, and separate transport/model RTT">Last peer RTT</th>
+                <th scope="col" title="Delivery rate / native pacing when observed / independent metric direction / provenance / scope">Transport rate</th>
+                <th scope="col" title="Loss / ECN">Transport loss</th>
+                <th scope="col" title="Transport ACK-rate share / 64 KiB serialization only; not capacity or end-to-end completion time">ACK share</th>
                 <th scope="col" title="Queue / native carrier flight / MPP data flight / native limit">Flight</th>
                 <th scope="col" title="Sender-direction confidence / samples / bytes / effective age and freshness window / native, Product, ACK and app-limited flags">Evidence</th>
                 <th scope="col" title="Active flows / latency-sensitive flows">Flows</th>
@@ -732,10 +732,10 @@
                     <th scope="col" title="Locally configured path / endpoint / peer Path ID / metric epoch / active observed hopping port">Path</th>
                     <th scope="col" title="Carrier">Carrier</th>
                     <th scope="col" title="Path usage and its traffic direction">Use</th>
-                    <th scope="col" title="Round-trip time / RTT variation / jitter / peer-advisory source">Latency</th>
-                    <th scope="col" title="Peer-advisory delivery and pacing / independent metric direction / provenance / scope">Rate</th>
-                    <th scope="col" title="Loss / ECN">Loss</th>
-                    <th scope="col" title="Peer-observed delivery-rate share / unloaded 64 KiB completion ETA">Quality</th>
+                    <th scope="col" title="Peer round trip is unavailable in legacy peer reports; reported transport/model RTT remains separate">Last peer RTT</th>
+                    <th scope="col" title="Peer-advisory delivery and pacing / independent metric direction / provenance / scope">Transport rate</th>
+                    <th scope="col" title="Loss / ECN">Transport loss</th>
+                    <th scope="col" title="Peer-observed transport ACK-rate share / 64 KiB serialization only; not capacity or end-to-end completion time">ACK share</th>
                     <th scope="col" title="Queue / native carrier flight / native limit">Flight</th>
                     <th scope="col" title="Sender-direction confidence / samples / bytes / wire age plus cached residence / freshness window / observation flags">Evidence</th>
                   </tr>

@@ -998,13 +998,8 @@ impl ClientPathContext {
     }
 
     pub(in crate::runtime) fn reliable_path_rtt_is_observed(&self, key: RelayPathKey) -> bool {
-        let health = self.state.health().lock().expect("client path health lock");
-        health.path_record(key).is_some_and(|record| {
-            record.carrier_srtt_ms.is_some()
-                || record.carrier_rttvar_ms.is_some()
-                || record.measured_srtt_ms.is_some()
-                || record.measured_jitter_ms.is_some()
-        })
+        self.reliable_path_snapshot(key)
+            .is_some_and(|snapshot| snapshot.peer_timing().is_observed())
     }
 
     pub(in crate::runtime) fn reliable_relay_path_eta_ms(

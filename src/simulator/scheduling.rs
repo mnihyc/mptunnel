@@ -384,14 +384,25 @@ fn adaptive_tail_avoidance_threshold_bytes(
 
 fn adaptive_duplication_eta_slack_ms(primary: PathSnapshot, candidate: PathSnapshot) -> f64 {
     let pto = path_pto_ms(primary).min(path_pto_ms(candidate));
-    let jitter = primary.jitter_ms.max(candidate.jitter_ms).max(0.0);
+    let jitter = primary
+        .peer_timing()
+        .rttvar_ms()
+        .max(candidate.peer_timing().rttvar_ms())
+        .max(0.0);
     (pto / QUIC_INITIAL_WINDOW_PACKETS).max(jitter)
 }
 
 fn path_rtt_samples_overlap(path: PathSnapshot, other: PathSnapshot) -> bool {
-    let path_window = path.jitter_ms.max(path.srtt_ms.max(1.0) / 4.0);
-    let other_window = other.jitter_ms.max(other.srtt_ms.max(1.0) / 4.0);
-    (path.srtt_ms - other.srtt_ms).abs() <= path_window.max(other_window)
+    let path_window = path
+        .peer_timing()
+        .rttvar_ms()
+        .max(path.peer_timing().srtt_ms().max(1.0) / 4.0);
+    let other_window = other
+        .peer_timing()
+        .rttvar_ms()
+        .max(other.peer_timing().srtt_ms().max(1.0) / 4.0);
+    (path.peer_timing().srtt_ms() - other.peer_timing().srtt_ms()).abs()
+        <= path_window.max(other_window)
 }
 
 #[cfg(test)]

@@ -95,6 +95,17 @@ fn t03_client_tcp_timing_is_exact_coherent_and_instance_scoped() {
         .expect("new live TCP timing");
     assert_eq!(current.round_trip_time(), Duration::from_millis(95));
     assert_eq!(current.variation(), None, "new R cannot borrow old J");
+    let projected = record.observation_at(Instant::now());
+    assert_eq!(
+        projected.carrier_rttvar_ms, None,
+        "the deployed projection cannot restore a variation absent from the accepted tuple"
+    );
+    assert!(
+        !path_snapshot(&path, 3, projected)
+            .peer_timing()
+            .is_observed(),
+        "native TCP evidence does not turn the MPP startup prior into an observation"
+    );
     assert_eq!(
         first_snapshot.directional_timing(),
         Some(first_timing),
@@ -1299,7 +1310,7 @@ fn quic_native_congestion_remains_diagnostic_without_becoming_product_feedback()
     assert_eq!(snapshot.product_progress_rate_bps, None);
     assert_eq!(snapshot.delivery_rate_bps, 200_000_000.0);
     assert_eq!(snapshot.carrier_inflight_limit_bytes, 4 * 1024 * 1024);
-    assert_eq!(snapshot.srtt_ms, 180.0);
+    assert_eq!(snapshot.transport_timing().srtt_ms(), 180.0);
     assert_eq!(snapshot.loss_rate, 0.0);
     let published =
         path_metrics_from_snapshot(snapshot, observation, PathMetricDirection::ClientToServer);
@@ -1894,4 +1905,103 @@ fn data_plane_failure_is_published_once_until_liveness_recovers() {
 
     assert_eq!(record.state, SchedulerPathState::Suspect);
     assert_eq!(record.consecutive_failures, 1);
+}
+
+#[test]
+fn peer_round_trip_is_independent_of_native_and_product_open_timing() {
+    use crate::model::path::CarrierPathInstanceId;
+
+    let mut record = ClientPathHealthRecord::default();
+    let instance = CarrierPathInstanceId::from_raw(8001);
+    record.install_tcp_peer_usage(PathId(3), instance, 0, PathUsage::Available);
+    assert!(record.mark_readiness_round_trip_for_instance(instance, Duration::from_millis(160)));
+    record.carrier_srtt_ms = Some(0.1);
+    record.mark_success_for_instance(instance, Duration::from_secs(2));
+    assert_eq!(
+        record.peer_round_trip.unwrap().elapsed,
+        Duration::from_millis(160)
+    );
+    assert_eq!(record.carrier_srtt_ms, Some(0.1));
+    assert_eq!(record.product_delivery_samples, 0);
+    let successor = CarrierPathInstanceId::from_raw(8002);
+    record.install_tcp_peer_usage(PathId(4), successor, 0, PathUsage::Available);
+    assert!(record.peer_round_trip.is_none());
+    assert!(!record.mark_readiness_round_trip_for_instance(instance, Duration::from_millis(1)));
+    assert!(record.peer_round_trip.is_none());
+}
+
+#[test]
+fn tcp_peer_timing_survives_native_and_target_updates_but_not_replacement() {
+    use crate::runtime::path::peer_round_trip::{PeerRoundTrip, PeerRoundTripSource};
+    let now = Instant::now();
+    let timing = Arc::new(PeerRoundTrip::new(
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+        crate::model::timing::PeerTiming::new(333.0, 0.0),
+    ));
+    timing.record(
+        Duration::from_millis(160),
+        now,
+        PeerRoundTripSource::Readiness,
+    );
+    let first = crate::model::path::next_carrier_path_instance_id();
+    let mut record = ClientPathHealthRecord::default();
+    record.install_tcp_peer_usage(PathId(0), first, 0, PathUsage::Available);
+    record.peer_timing = Some(timing.clone());
+    assert!(record.mark_tcp_transport_state(first, request_tcp_native_observation(0)));
+    assert!(record.mark_success_for_instance(first, Duration::from_secs(5)));
+    let path = "tcp://127.0.0.1:10000".parse::<PathSpec>().unwrap();
+    let snapshot = path_snapshot(
+        &path,
+        0,
+        record.observation_at(now + Duration::from_secs(1)),
+    );
+    assert_eq!(snapshot.transport_timing().srtt_ms(), 180.0);
+    assert_eq!(snapshot.peer_timing().srtt_ms(), 160.0);
+    assert_eq!(timing.last().unwrap().observed_at, now);
+    record.carrier_srtt_ms = Some(0.1);
+    record.carrier_rttvar_ms = Some(0.025);
+    let acked_at = now + Duration::from_secs(1);
+    record.mark_product_delivery_at(
+        PathRateSample::new(64 * 1024, Duration::from_millis(160)).unwrap(),
+        acked_at,
+        false,
+    );
+    assert_eq!(
+        record.product_delivery_rate_expires_at,
+        Some(acked_at + snapshot.peer_timing().rate_freshness_horizon())
+    );
+    assert_eq!(
+        timing.last().unwrap().observed_at,
+        now,
+        "Data ACK is not a peer RTT sample"
+    );
+    let expired = path_snapshot(
+        &path,
+        0,
+        record.observation_at(now + Duration::from_secs(41)),
+    );
+    assert_eq!(expired.peer_timing().srtt_ms(), 333.0);
+    assert!(
+        !expired.peer_timing().is_observed(),
+        "native RTT does not renew peer evidence"
+    );
+    let successor = crate::model::path::next_carrier_path_instance_id();
+    record.install_tcp_peer_usage(PathId(0), successor, 0, PathUsage::Available);
+    timing.record(
+        Duration::from_millis(1),
+        now + Duration::from_secs(2),
+        PeerRoundTripSource::Heartbeat,
+    );
+    assert!(record.peer_timing.is_none());
+    assert_eq!(
+        path_snapshot(
+            &path,
+            0,
+            record.observation_at(now + Duration::from_secs(2))
+        )
+        .peer_timing()
+        .srtt_ms(),
+        333.0
+    );
 }

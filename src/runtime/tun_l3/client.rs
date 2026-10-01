@@ -8,7 +8,7 @@ use super::queue::{IpPacketQueueBudget, IpPacketQueuePermit};
 use crate::ingress::TunL3IngressConfig;
 use crate::model::carrier_rate_authority::CarrierRateAuthorityScope;
 use crate::model::path::{CarrierPathInstanceId, RelayPathKey};
-use crate::model::timing::{path_open_timeout, transport_pto_from_snapshot};
+use crate::model::timing::{path_open_timeout, peer_pto_from_snapshot};
 use crate::model::tun_l3::{IpPacketFlowKey, parse_ip_packet};
 use crate::platform::{PacketDeviceConfig, PacketDeviceProvider};
 use crate::protocol::{
@@ -544,7 +544,7 @@ impl ClientIpTunnelState {
                 }
                 let result = carrier.try_send(packet_id, payload, &self.carrier_packet_budget);
                 if result.is_ok() {
-                    let flowlet_timeout = transport_pto_from_snapshot(Some(candidate.snapshot));
+                    let flowlet_timeout = peer_pto_from_snapshot(Some(candidate.snapshot));
                     self.flows
                         .bind(flow.clone(), carrier_key, Instant::now(), flowlet_timeout);
                 }
@@ -666,13 +666,17 @@ fn client_native_packet_flowlet_timeout(
     let mut snapshot = candidate
         .snapshot
         .with_scheduling_service_rate(current_shape.service_rate());
-    snapshot.srtt_ms = if current_shape.srtt().is_zero() {
-        crate::runtime::path::model::default_path_srtt_ms()
-    } else {
-        current_shape.srtt().as_secs_f64() * 1_000.0
-    };
-    snapshot.jitter_ms = current_shape.rttvar().as_secs_f64() * 1_000.0;
-    Some(transport_pto_from_snapshot(Some(snapshot)))
+    snapshot.set_timing(crate::model::timing::PathTiming::quic(
+        crate::model::timing::TransportTiming::from_native_or_prior(
+            current_shape.srtt(),
+            current_shape.rttvar(),
+            crate::model::timing::TransportTiming::prior(
+                crate::runtime::path::model::default_path_srtt_ms(),
+                0.0,
+            ),
+        ),
+    ));
+    Some(peer_pto_from_snapshot(Some(snapshot)))
 }
 
 impl From<PacketPathAttachment> for ClientIpCarrierKey {
@@ -1005,7 +1009,7 @@ async fn run_udp_carrier_supervisor(
                     "TUN-L3 attachment on QUIC path {} failed: {error}; retrying",
                     client_tun_l3_path_name(&context, path),
                 );
-                let retry = transport_pto_from_snapshot(context.reliable_path_snapshot(path));
+                let retry = peer_pto_from_snapshot(context.reliable_path_snapshot(path));
                 tokio::select! {
                     _ = tokio::time::sleep(retry) => {}
                     changed = close_events.changed() => {
@@ -1066,7 +1070,7 @@ async fn run_tcp_carrier_supervisor(
                         "TUN-L3 attachment on TCP path {} failed: {error}; retrying",
                         client_tun_l3_path_name(&context, path),
                     );
-                    let retry = transport_pto_from_snapshot(context.reliable_path_snapshot(path));
+                    let retry = peer_pto_from_snapshot(context.reliable_path_snapshot(path));
                     tokio::select! {
                         _ = tokio::time::sleep(retry) => {}
                         changed = close_events.changed() => {
@@ -1107,7 +1111,7 @@ async fn run_tcp_carrier_supervisor(
                     "TUN-L3 attachment on TCP path {} failed: {error}; retrying",
                     client_tun_l3_path_name(&context, path),
                 );
-                let retry = transport_pto_from_snapshot(context.reliable_path_snapshot(path));
+                let retry = peer_pto_from_snapshot(context.reliable_path_snapshot(path));
                 tokio::select! {
                     _ = tokio::time::sleep(retry) => {}
                     changed = close_events.changed() => {

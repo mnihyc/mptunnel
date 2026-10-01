@@ -343,6 +343,61 @@ async fn server_data_ack_is_offered_before_first_target_write_completes() {
     .expect("second retained write completes when the target drains");
     assert_eq!(&second, b"cd");
     assert_eq!(accepted.load(Ordering::Acquire), 4);
+
+    // A ready target must not delay receipt more than a blocked target. Wait
+    // for the preceding flush, then admit one byte that fits without Pending.
+    // The next MAX_DATA publication is a real actor barrier, not a timer.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while binding.feedback_status().max_data.published_offset != Some(initial_grant + 4) {
+            tokio::select! {
+                result = relay.as_mut() => panic!("open stream must remain live: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("second write flushes");
+    while let Some(command) = try_recv_reliable_path_command(&mut receivers) {
+        receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&command));
+    }
+    pending.store(false, Ordering::Release);
+    frames_tx
+        .send(Ok(Frame::StreamData {
+            stream_id,
+            offset: 4,
+            payload: Bytes::from_static(b"e"),
+        }))
+        .await
+        .expect("subthreshold receipt into ready target");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while binding.feedback_status().max_data.published_offset != Some(initial_grant + 5) {
+            tokio::select! {
+                result = relay.as_mut() => panic!("open stream must remain live: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("ready target write flushes");
+    assert!(!pending.load(Ordering::Acquire));
+    assert_eq!(
+        binding.feedback_status().ack_generation,
+        3,
+        "each received batch publishes new receipt without waiting for peer PTO or target backpressure"
+    );
+    let ack = try_recv_reliable_path_command(&mut receivers).expect("ready-target receipt");
+    receivers.release_pending_command_bytes(reliable_path_command_pending_bytes(&ack));
+    assert!(
+        matches!(ack, ReliablePathCommand::SendFrame(Frame::StreamAck {
+        stream_id: id, scope_start: None, ranges,
+    }) if id == stream_id && ranges == vec![OffsetRange { start: 0, end: 5 }])
+    );
+    let mut third = [0_u8; 1];
+    application
+        .read_exact(&mut third)
+        .await
+        .expect("ready target byte");
+    assert_eq!(&third, b"e");
     drop(relay);
     let mut extra = Vec::new();
     application
@@ -2274,14 +2329,15 @@ async fn server_relay_applies_path_detach_after_request_half_close_without_respo
 }
 
 fn record_server_delivery_evidence(binding: &ResponseStreamBinding, key: CarrierPathKey) {
-    record_server_delivery_evidence_with_srtt(binding, key, 40_000);
+    record_server_delivery_and_peer_timing(binding, key, 40_000);
 }
 
-fn record_server_delivery_evidence_with_srtt(
+fn record_server_delivery_and_peer_timing(
     binding: &ResponseStreamBinding,
     key: CarrierPathKey,
     srtt_us: u32,
 ) {
+    binding.set_output_peer_timing_for_test(key, f64::from(srtt_us) / 1000.0, 5.0);
     binding.update_path_metrics(
         key,
         PathMetrics {
@@ -2351,8 +2407,8 @@ fn ambiguous_prefix_ack_cannot_withdraw_a_fresh_response_tail_beyond_the_horizon
     );
     binding.mark_output_path_proven_for_test(quic);
     binding.mark_output_path_proven_for_test(tcp);
-    record_server_delivery_evidence_with_srtt(&binding, quic, 1_000);
-    record_server_delivery_evidence_with_srtt(&binding, tcp, 1_000);
+    record_server_delivery_and_peer_timing(&binding, quic, 1_000);
+    record_server_delivery_and_peer_timing(&binding, tcp, 1_000);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -3217,7 +3273,7 @@ fn with_response_retained_clock_fixture(
         commands,
         TrafficClass::Latency,
     );
-    record_server_delivery_evidence_with_srtt(&binding, key, 40_000);
+    record_server_delivery_and_peer_timing(&binding, key, 40_000);
     let mut send_stream =
         ReliableSendStream::new_with_initial_max_offset(StreamId(315), limits, u64::MAX);
     let frame = send_stream
@@ -3248,7 +3304,7 @@ fn response_retained_owner_deadlines_survive_rtt_growth_but_fresh_assignments_us
         assert_eq!(old_deadline, old.sent_at + initial_interval);
         assert!(first.mature_frontier.is_none());
 
-        record_server_delivery_evidence_with_srtt(&binding, key, 800_000);
+        record_server_delivery_and_peer_timing(&binding, key, 800_000);
         let longer_interval = reliable_data_retransmission_interval(
             Some(key.underlay),
             binding.tail_reinjection_snapshot(0, lane),
@@ -3352,7 +3408,7 @@ fn response_retained_owner_ack_fragments_keep_one_assignment_deadline() {
             if let Some(original_deadline) = original_deadline {
                 assert_eq!(deadline, original_deadline);
             }
-            record_server_delivery_evidence_with_srtt(&binding, key, 800_000);
+            record_server_delivery_and_peer_timing(&binding, key, 800_000);
             let right = binding
                 .observe_live_owner_retained_frontier(
                     OffsetRange { start: 32, end: 64 },
@@ -6441,9 +6497,9 @@ fn response_fin_keeps_its_exact_decide_target_across_metric_churn() {
     for key in [owner_key, selected_key, challenger_key] {
         binding.mark_output_path_proven_for_test(key);
     }
-    record_server_delivery_evidence_with_srtt(&binding, owner_key, 300_000);
-    record_server_delivery_evidence_with_srtt(&binding, selected_key, 10_000);
-    record_server_delivery_evidence_with_srtt(&binding, challenger_key, 100_000);
+    record_server_delivery_and_peer_timing(&binding, owner_key, 300_000);
+    record_server_delivery_and_peer_timing(&binding, selected_key, 10_000);
+    record_server_delivery_and_peer_timing(&binding, challenger_key, 100_000);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -6556,8 +6612,8 @@ fn response_fin_keeps_its_exact_decide_target_across_metric_churn() {
         "response FIN successor G uses selected target R_t rather than owner R",
     );
 
-    record_server_delivery_evidence_with_srtt(&binding, selected_key, 200_000);
-    record_server_delivery_evidence_with_srtt(&binding, challenger_key, 1_000);
+    record_server_delivery_and_peer_timing(&binding, selected_key, 200_000);
+    record_server_delivery_and_peer_timing(&binding, challenger_key, 1_000);
     let data_ack_outstanding_bytes = send_stream.reinjection_bytes();
     let dispatch = response_sender
         .dispatch_next_with_data_ack_outstanding(
@@ -7432,8 +7488,8 @@ fn persistent_response_ack_gap_commits_only_the_ranked_frontier_quantum() {
         ),
         ResponseStreamAttachOutcome::Attached
     );
-    record_server_delivery_evidence_with_srtt(&binding, original_key, 80_000);
-    record_server_delivery_evidence_with_srtt(&binding, reinjection_key, 100_000);
+    record_server_delivery_and_peer_timing(&binding, original_key, 80_000);
+    record_server_delivery_and_peer_timing(&binding, reinjection_key, 100_000);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {
@@ -7555,7 +7611,7 @@ fn persistent_response_ack_gap_commits_only_the_ranked_frontier_quantum() {
             TrafficClass::Throughput,
         )
         .expect("fill the only exact alternate after timing observation");
-    record_server_delivery_evidence_with_srtt(&binding, original_key, 500_000);
+    record_server_delivery_and_peer_timing(&binding, original_key, 500_000);
     let absent = clock_sender
         .ack_gap_reinjection_path_snapshot(
             &path_stream,
@@ -7604,7 +7660,7 @@ fn persistent_response_ack_gap_commits_only_the_ranked_frontier_quantum() {
         Some(retained_owner_deadline),
         "target reappearance cannot begin a later owner epoch",
     );
-    record_server_delivery_evidence_with_srtt(&binding, original_key, 80_000);
+    record_server_delivery_and_peer_timing(&binding, original_key, 80_000);
 
     for zero_authority_limits in [
         MuxLimits::from(ResourceLimits {
@@ -7861,7 +7917,7 @@ fn draining_response_owner_retains_one_distinct_ack_gap_recovery_target() {
         ),
         ResponseStreamAttachOutcome::Attached,
     );
-    record_server_delivery_evidence_with_srtt(&binding, reinjection_key, 100_000);
+    record_server_delivery_and_peer_timing(&binding, reinjection_key, 100_000);
 
     let (_frame_tx, frame_rx) = mpsc::channel(1);
     let path_stream = ReliablePathStream {

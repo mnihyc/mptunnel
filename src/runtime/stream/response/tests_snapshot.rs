@@ -1861,7 +1861,7 @@ fn non_native_udp_scalar_prefers_local_then_fresh_peer_then_startup() {
 
     let hinted =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    assert_eq!(hinted.srtt_ms, 9.0);
+    assert_eq!(hinted.transport_timing().srtt_ms(), 9.0);
     assert_eq!(hinted.delivery_rate_bps, 330_000_000.0);
     let service_rate = hinted
         .scheduling_service_rate()
@@ -1919,7 +1919,7 @@ fn non_native_udp_scalar_prefers_local_then_fresh_peer_then_startup() {
     ));
     let local =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    assert_eq!(local.srtt_ms, 35.0);
+    assert_eq!(local.transport_timing().srtt_ms(), 35.0);
     assert_eq!(local.delivery_rate_bps, 110_000_000.0);
     assert_eq!(local.carrier_delivery_rate_bps, Some(110_000_000.0));
     assert_eq!(local.scheduling_service_rate(), Some(service_rate));
@@ -1930,7 +1930,11 @@ fn non_native_udp_scalar_prefers_local_then_fresh_peer_then_startup() {
     entry.srtt_ms = Some(55.0);
     let learned =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    assert_eq!(learned.srtt_ms, 55.0);
+    assert_eq!(
+        learned.transport_timing().srtt_ms(),
+        crate::runtime::path::model::default_path_srtt_ms(),
+        "Product elapsed time cannot manufacture a native transport observation"
+    );
     assert_eq!(learned.delivery_rate_bps, 77_000_000.0);
     assert_eq!(learned.rate_scope, PathRateScope::PerFlowGoodput);
     assert_eq!(learned.product_progress_rate_bps, Some(77_000_000.0));
@@ -1966,13 +1970,16 @@ fn opposite_direction_peer_hint_is_not_response_rate_authority() {
 }
 
 #[test]
-fn path_proof_supplies_only_fallback_rtt_until_newer_transport_evidence() {
+fn path_proof_peer_timing_survives_newer_independent_transport_evidence() {
     let key = CarrierPathKey {
         underlay: UnderlayProtocol::Tcp,
         path_id: PathId(4),
     };
     let (commands, _receivers) = reliable_path_command_channels(8);
     let mut entry = output_entry(key, commands);
+    entry.commands = entry.commands.with_peer_timing(
+        crate::runtime::path::peer_round_trip::PeerRoundTrip::for_test(20.0, 10.0).reader(),
+    );
     let now = Instant::now();
     let sent_at = now
         .checked_sub(Duration::from_millis(30))
@@ -1994,7 +2001,8 @@ fn path_proof_supplies_only_fallback_rtt_until_newer_transport_evidence() {
 
     let proof_rtt =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    assert_eq!(proof_rtt.srtt_ms, 20.0);
+    assert_eq!(proof_rtt.transport_timing().srtt_ms(), 35.0);
+    assert_eq!(proof_rtt.peer_timing().srtt_ms(), 20.0);
     assert_eq!(proof_rtt.delivery_rate_bps, portable_startup_rate_bps(),);
     assert_eq!(proof_rtt.carrier_delivery_rate_bps, Some(500_000_000.0));
     assert_eq!(proof_rtt.pacing_rate_bps, 600_000_000.0);
@@ -2012,7 +2020,8 @@ fn path_proof_supplies_only_fallback_rtt_until_newer_transport_evidence() {
         .recorded_at = now;
     let newer_native =
         server_bulk_output_snapshot(&entry, 0, TrafficClass::Throughput, MuxLimits::default());
-    assert_eq!(newer_native.srtt_ms, 35.0);
+    assert_eq!(newer_native.transport_timing().srtt_ms(), 35.0);
+    assert_eq!(newer_native.peer_timing().srtt_ms(), 20.0);
     assert_eq!(newer_native.delivery_rate_bps, portable_startup_rate_bps(),);
     assert_eq!(newer_native.carrier_delivery_rate_bps, Some(500_000_000.0));
 }
@@ -2283,4 +2292,64 @@ fn closed_and_draining_outputs_are_excluded_from_new_product_selection() {
         source.selected_path.map(|path| path.id),
         Some(live_key.path_id)
     );
+}
+
+#[test]
+fn response_peer_timing_is_shared_across_outputs_and_independent_of_native_metrics() {
+    use crate::model::timing::PeerTiming;
+    use crate::runtime::path::peer_round_trip::{PeerRoundTrip, PeerRoundTripSource};
+    let now = Instant::now();
+    let timing = std::sync::Arc::new(PeerRoundTrip::new(
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+        PeerTiming::new(333.0, 0.0),
+    ));
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let key = CarrierPathKey {
+        underlay: UnderlayProtocol::Tcp,
+        path_id: PathId(61),
+    };
+    let mut entry = output_entry(key, commands.with_peer_timing(timing.reader()));
+    let sibling = output_entry(key, entry.commands.clone());
+    entry.local_path_metrics = Some(path_metrics(
+        key,
+        ServerPathMetricsSource::LocalSender,
+        100,
+        100_000_000,
+        100_000_000,
+    ));
+    timing.record(
+        Duration::from_millis(160),
+        now,
+        PeerRoundTripSource::Heartbeat,
+    );
+    let snapshot = server_bulk_output_snapshot_at(
+        &entry,
+        0,
+        TrafficClass::Throughput,
+        MuxLimits::default(),
+        now,
+    );
+    assert_eq!(snapshot.transport_timing().srtt_ms(), 0.1);
+    assert_eq!(snapshot.peer_timing().srtt_ms(), 160.0);
+    assert_eq!(
+        server_bulk_output_snapshot_at(
+            &sibling,
+            0,
+            TrafficClass::Throughput,
+            MuxLimits::default(),
+            now
+        )
+        .peer_timing(),
+        snapshot.peer_timing()
+    );
+    let expired = server_bulk_output_snapshot_at(
+        &entry,
+        0,
+        TrafficClass::Throughput,
+        MuxLimits::default(),
+        now + Duration::from_secs(41),
+    );
+    assert_eq!(expired.peer_timing().srtt_ms(), 333.0);
+    assert_eq!(timing.last().unwrap().observed_at, now);
 }

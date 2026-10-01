@@ -428,7 +428,7 @@ async fn prepared_tcp_recovery_serves_two_due_ranges_before_fresh_original_witho
                     ready_outputs.contains(&id), target.product_admission_active,
                     path.stale_for_original_data, path.has_bulk_rate_evidence,
                     path.product_assignment_qualified, target.can_enqueue_reinjection_frame(expected),
-                    path.snapshot.state, path.snapshot.peer_usage, path.snapshot.srtt_ms,
+                    path.snapshot.state, path.snapshot.peer_usage, path.snapshot.transport_timing().srtt_ms(),
                     path.snapshot.delivery_rate_bps, path.snapshot.data_level_limit_bytes,
                     path.original_data_in_flight_bytes, path.snapshot.queue_bytes,
                     path.snapshot.bytes_in_flight)
@@ -627,7 +627,7 @@ async fn prepared_tcp_latency_completion_reaches_peer_before_owner_fallback() {
                     target.observation.key,
                     target.product_admission_active,
                     target.observation.has_bulk_rate_evidence,
-                    target.observation.snapshot.srtt_ms,
+                    target.observation.snapshot.transport_timing().srtt_ms(),
                     target.observation.snapshot.delivery_rate_bps,
                 )
             })

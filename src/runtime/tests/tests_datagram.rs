@@ -526,6 +526,7 @@ fn fresh_tcp_datagram_carrier_keeps_initial_pto_floor_after_live_probe() {
         index: 0,
     };
     context.mark_tcp_path_probe_success(0, Duration::from_millis(20));
+    context.health().lock().unwrap().tcp[0].set_peer_timing_for_test(20.0, 1.0);
     assert!(context.reliable_path_rtt_is_observed(key));
     assert!(path_open_pto(context.tcp_path_snapshot(0), true) < default_transport_pto());
 
@@ -676,7 +677,7 @@ fn datagram_feedback_retry_budget_scales_from_ttl_slack_and_path_model() {
 fn tcp_datagram_response_timeout_uses_tcp_path_response_model() {
     let mut high_rtt_tcp =
         PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 250.0, 200_000_000.0);
-    high_rtt_tcp.jitter_ms = 20.0;
+    high_rtt_tcp.set_rttvar_for_test(20.0);
 
     let startup_timeout =
         tcp_datagram_response_timeout(high_rtt_tcp, None, None, DEFAULT_SOCKS5_UDP_TTL_MS);
@@ -951,7 +952,8 @@ fn endpoint_only_tcp_open_reservations_prefer_authenticated_readiness_timing() {
                 0,
                 PathUsage::Available,
             );
-            health.tcp[index].mark_success(Duration::from_millis(readiness_rtt));
+            health.tcp[index]
+                .set_peer_timing_for_test(readiness_rtt as f64, readiness_rtt as f64 / 8.0);
         }
     }
     // A generic probe is not authenticated carrier readiness and must not
@@ -1017,6 +1019,7 @@ fn endpoint_only_mixed_reservation_prefers_proven_low_rtt_over_unproven_idle_pat
         },
     );
 
+    context.health().lock().expect("health lock").tcp[0].set_peer_timing_for_test(40.0, 5.0);
     let second = context
         .reserve_reliable_stream_path(TrafficClass::Latency, PATH_OPEN_SCORE_BYTES, &[])
         .expect("second reservation");
@@ -1213,8 +1216,8 @@ fn quic_path_metrics_feed_path_model_without_fake_bulk_evidence() {
     }
 
     let snapshot = context.udp_path_snapshot(0).expect("snapshot");
-    assert_eq!(snapshot.srtt_ms, 42.0);
-    assert_eq!(snapshot.jitter_ms, 7.0);
+    assert_eq!(snapshot.transport_timing().srtt_ms(), 42.0);
+    assert_eq!(snapshot.transport_timing().rttvar_ms(), 7.0);
     assert_eq!(snapshot.bytes_in_flight, 48 * 1024);
     assert_eq!(snapshot.queue_bytes, 16 * 1024);
     assert_eq!(snapshot.carrier_inflight_limit_bytes, 512 * 1024);

@@ -50,6 +50,7 @@ pub(in crate::runtime) struct ReliablePathCommandSender {
     metrics: Arc<ReliablePathCommandQueueMetrics>,
     native_rate_authority: Option<Arc<NativeCarrierRateAuthorityHandle>>,
     attachment: Option<Arc<ReliablePathAttachmentFence>>,
+    peer_timing: Option<super::peer_round_trip::PeerRoundTripReader>,
 }
 
 pub(in crate::runtime) struct ReliablePathCommandReceivers {
@@ -1191,6 +1192,23 @@ impl Drop for ReliablePathCommandReceivers {
 }
 
 impl ReliablePathCommandSender {
+    pub(in crate::runtime) fn with_peer_timing(
+        mut self,
+        timing: super::peer_round_trip::PeerRoundTripReader,
+    ) -> Self {
+        self.peer_timing = Some(timing);
+        self
+    }
+
+    pub(in crate::runtime) fn peer_timing_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<crate::model::timing::PeerTiming> {
+        self.peer_timing
+            .as_ref()
+            .map(|timing| timing.timing_at(now))
+    }
+
     /// Bind before publishing OPEN so pending cleanup and accepted Product work
     /// retain the same attachment lifetime. Carrier-level senders stay unbound.
     pub(in crate::runtime) fn for_new_attachment(&self, stream_id: StreamId) -> Self {
@@ -2141,6 +2159,7 @@ pub(in crate::runtime) fn reliable_path_command_channels(
             metrics: metrics.clone(),
             native_rate_authority: None,
             attachment: None,
+            peer_timing: None,
         },
         ReliablePathCommandReceivers {
             prepared_waits: prepared_waits_rx,

@@ -6,7 +6,8 @@
 
 use crate::protocol::Frame;
 use crate::runtime::error::RuntimeError;
-use std::sync::{Mutex, MutexGuard};
+use crate::runtime::path::peer_round_trip::{PeerRoundTrip, PeerRoundTripSource};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -66,6 +67,7 @@ enum HeartbeatState {
         due_at: tokio::time::Instant,
         deadline: tokio::time::Instant,
         phase: SendPhase,
+        sent_at: tokio::time::Instant,
     },
     Draining {
         tombstone: Option<u64>,
@@ -74,6 +76,7 @@ enum HeartbeatState {
 }
 
 struct Inner {
+    sample_due_at: Option<tokio::time::Instant>,
     state: HeartbeatState,
     delay: Duration,
     random_error: Option<getrandom::Error>,
@@ -83,8 +86,8 @@ struct Inner {
 pub(in crate::runtime::path::tcp) struct TcpCarrierHeartbeat {
     interval: Duration,
     timeout: Duration,
+    peer_timing: Option<Arc<PeerRoundTrip>>,
     inner: Mutex<Inner>,
-    failure_tx: watch::Sender<Option<TcpCarrierHeartbeatFailure>>,
     schedule_tx: watch::Sender<u64>,
 }
 
@@ -96,28 +99,53 @@ impl TcpCarrierHeartbeat {
         initial_random_sample: u64,
     ) -> Self {
         let delay = heartbeat_renewal_delay(interval, initial_random_sample);
-        let (failure_tx, _) = watch::channel(None);
         let (schedule_tx, _) = watch::channel(0);
         Self {
             interval,
             timeout,
+            peer_timing: None,
             inner: Mutex::new(Inner {
+                sample_due_at: None,
                 state: HeartbeatState::Idle {
                     due_at: started_at + delay,
                 },
                 delay,
                 random_error: None,
             }),
-            failure_tx,
             schedule_tx,
         }
+    }
+
+    /// Reuse the existing challenge for peer timing even under continuous
+    /// receive traffic. The server has no readiness RTT, so it requests an
+    /// initial exchange; the client already has authenticated readiness.
+    pub(in crate::runtime::path::tcp) fn with_peer_timing(
+        mut self,
+        timing: Arc<PeerRoundTrip>,
+        probe_immediately: bool,
+    ) -> Self {
+        let inner = self.inner.get_mut().expect("heartbeat lock");
+        if let HeartbeatState::Idle { due_at } = inner.state {
+            inner.sample_due_at = Some(if probe_immediately {
+                tokio::time::Instant::now()
+            } else {
+                due_at
+            });
+        }
+        self.peer_timing = Some(timing);
+        self
     }
 
     /// The next actor action is due only while idle. The independent failure
     /// future owns the immutable due-plus-timeout bound while a send is pending.
     pub(in crate::runtime::path::tcp) fn next_due_at(&self) -> Option<tokio::time::Instant> {
-        match self.lock().state {
-            HeartbeatState::Idle { due_at } => Some(due_at),
+        let inner = self.lock();
+        match inner.state {
+            HeartbeatState::Idle { due_at } => Some(
+                inner
+                    .sample_due_at
+                    .map_or(due_at, |sample| sample.min(due_at)),
+            ),
             HeartbeatState::Pending { .. }
             | HeartbeatState::Draining { .. }
             | HeartbeatState::Failed(_) => None,
@@ -160,9 +188,16 @@ impl TcpCarrierHeartbeat {
     ) -> TcpCarrierHeartbeatClaim {
         let mut inner = self.lock();
         match inner.state {
-            HeartbeatState::Idle { due_at } if now < due_at => TcpCarrierHeartbeatClaim::NotDue,
+            HeartbeatState::Idle { due_at }
+                if now
+                    < inner
+                        .sample_due_at
+                        .map_or(due_at, |sample| sample.min(due_at)) =>
+            {
+                TcpCarrierHeartbeatClaim::NotDue
+            }
             HeartbeatState::Idle { due_at } => {
-                let deadline = due_at + self.timeout;
+                let deadline = due_at.min(now) + self.timeout;
                 if now >= deadline {
                     TcpCarrierHeartbeatClaim::Failed(
                         self.fail_locked(
@@ -178,7 +213,12 @@ impl TcpCarrierHeartbeat {
                                 due_at,
                                 deadline,
                                 phase: SendPhase::Sending,
+                                sent_at: now,
                             };
+                            // A timing challenge can precede the idle deadline.
+                            // Both actor and failure waiters must reread this
+                            // owner's state, including while the writer blocks.
+                            self.notify_schedule_change();
                             TcpCarrierHeartbeatClaim::Claimed(TcpCarrierHeartbeatPing {
                                 nonce,
                                 due_at,
@@ -245,6 +285,7 @@ impl TcpCarrierHeartbeat {
                 due_at,
                 deadline,
                 phase: SendPhase::Sending,
+                sent_at,
             } if pending_nonce == nonce => {
                 if flushed_at >= deadline {
                     let failure = self
@@ -256,6 +297,7 @@ impl TcpCarrierHeartbeat {
                         due_at,
                         deadline,
                         phase: SendPhase::AwaitingPong,
+                        sent_at,
                     };
                     Ok(())
                 }
@@ -313,6 +355,7 @@ impl TcpCarrierHeartbeat {
                         due_at: _,
                         deadline,
                         phase,
+                        sent_at,
                     } => {
                         if observed_at >= deadline {
                             let failure = match phase {
@@ -331,6 +374,14 @@ impl TcpCarrierHeartbeat {
                             match renewal_source() {
                                 Ok(sample) => {
                                     let delay = heartbeat_renewal_delay(self.interval, sample);
+                                    if let Some(timing) = &self.peer_timing {
+                                        timing.record(
+                                            observed_at.saturating_duration_since(sent_at),
+                                            observed_at.into_std(),
+                                            PeerRoundTripSource::Heartbeat,
+                                        );
+                                        inner.sample_due_at = Some(observed_at + delay);
+                                    }
                                     inner.delay = delay;
                                     inner.state = HeartbeatState::Idle {
                                         due_at: observed_at + delay,
@@ -427,16 +478,17 @@ impl TcpCarrierHeartbeat {
     }
 
     async fn wait_for_failure(&self) -> TcpCarrierHeartbeatFailure {
-        let mut failure_rx = self.failure_tx.subscribe();
+        let mut schedule_rx = self.schedule_tx.subscribe();
         loop {
-            if let Some(failure) = *failure_rx.borrow_and_update() {
+            let _ = *schedule_rx.borrow_and_update();
+            if let Some(failure) = self.current_failure() {
                 return failure;
             }
             let deadline = self.failure_deadline();
             if let Some(deadline) = deadline {
                 tokio::select! {
                     biased;
-                    changed = failure_rx.changed() => {
+                    changed = schedule_rx.changed() => {
                         if changed.is_err() {
                             std::future::pending::<()>().await;
                         }
@@ -445,7 +497,7 @@ impl TcpCarrierHeartbeat {
                         self.expire(tokio::time::Instant::now());
                     }
                 }
-            } else if failure_rx.changed().await.is_err() {
+            } else if schedule_rx.changed().await.is_err() {
                 std::future::pending::<()>().await;
             }
         }
@@ -519,7 +571,6 @@ impl TcpCarrierHeartbeat {
             return existing;
         }
         inner.state = HeartbeatState::Failed(failure);
-        self.failure_tx.send_replace(Some(failure));
         self.notify_schedule_change();
         failure
     }
@@ -560,6 +611,133 @@ fn duration_from_nanos(nanos: u128) -> Duration {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn timed_owner(
+        start: tokio::time::Instant,
+        immediate: bool,
+    ) -> (TcpCarrierHeartbeat, Arc<PeerRoundTrip>) {
+        let timing = Arc::new(PeerRoundTrip::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            crate::model::timing::PeerTiming::new(333.0, 0.0),
+        ));
+        let owner =
+            TcpCarrierHeartbeat::new(Duration::from_secs(10), Duration::from_secs(30), start, 0)
+                .with_peer_timing(timing.clone(), immediate);
+        (owner, timing)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_carrier_samples_from_send_attempt_and_accepts_pong_before_flush() {
+        let start = tokio::time::Instant::now();
+        let (heartbeat, timing) = timed_owner(start, false);
+        for seconds in 1..=9 {
+            heartbeat.observe_authenticated_frame_at(
+                &Frame::Ping { nonce: 11 },
+                start + Duration::from_secs(seconds),
+                || Ok(0),
+            );
+        }
+        // Receive activity defers idle expiry, but not peer measurement. A late
+        // actor wake must not include the missed scheduling time in the RTT.
+        assert_eq!(
+            heartbeat.next_due_at(),
+            Some(start + Duration::from_secs(8))
+        );
+        let sent = start + Duration::from_secs(10);
+        let TcpCarrierHeartbeatClaim::Claimed(ping) = heartbeat.claim_due_ping(sent, || Ok(42))
+        else {
+            panic!("due sample");
+        };
+        assert_eq!(ping.deadline, sent + Duration::from_secs(30));
+        let received = sent + Duration::from_millis(160);
+        heartbeat.observe_authenticated_frame_at(&Frame::Pong { nonce: 42 }, received, || Ok(0));
+        heartbeat
+            .mark_ping_flushed(42, received + Duration::from_millis(10))
+            .unwrap();
+        assert_eq!(timing.last().unwrap().elapsed, Duration::from_millis(160));
+        assert_eq!(timing.last().unwrap().observed_at, received.into_std());
+        assert_eq!(
+            heartbeat.next_due_at(),
+            Some(received + Duration::from_secs(8))
+        );
+        assert!(
+            timing
+                .timing_at((received + Duration::from_secs(41)).into_std())
+                .is_none()
+        );
+        assert!(
+            timing.last().is_some(),
+            "stale evidence remains diagnostic, never renewed by reads"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_bootstrap_and_invalid_replies_do_not_create_peer_evidence() {
+        let start = tokio::time::Instant::now();
+        for invalid in ["nonce", "expiry", "drain"] {
+            let (heartbeat, timing) = timed_owner(start, true);
+            let TcpCarrierHeartbeatClaim::Claimed(ping) = heartbeat.claim_due_ping(start, || Ok(7))
+            else {
+                panic!("initial server sample");
+            };
+            if invalid == "drain" {
+                heartbeat.begin_drain_at(start);
+            }
+            heartbeat.observe_authenticated_frame_at(
+                &Frame::Pong {
+                    nonce: if invalid == "nonce" { 8 } else { 7 },
+                },
+                if invalid == "expiry" {
+                    ping.deadline
+                } else {
+                    start + Duration::from_millis(20)
+                },
+                || Ok(0),
+            );
+            assert!(
+                timing.last().is_none(),
+                "{invalid} is not an accepted peer exchange"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_probe_rearms_an_already_waiting_failure_guard() {
+        for flushed in [false, true] {
+            let start = tokio::time::Instant::now();
+            let (heartbeat, timing) = timed_owner(start, true);
+            let heartbeat = Arc::new(heartbeat);
+            let failure = heartbeat.clone().failure_future();
+            tokio::pin!(failure);
+            // Start waiting on the later idle deadline before publication of
+            // the initial timing challenge shortens the response deadline.
+            tokio::select! {
+                biased;
+                result = &mut failure => panic!("healthy carrier failed: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+            let TcpCarrierHeartbeatClaim::Claimed(ping) = heartbeat.claim_due_ping(start, || Ok(9))
+            else {
+                panic!("initial peer challenge");
+            };
+            if flushed {
+                heartbeat.mark_ping_flushed(ping.nonce, start).unwrap();
+            }
+            tokio::time::advance(ping.deadline.duration_since(start)).await;
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(1), &mut failure)
+                    .await
+                    .expect("pending challenge must enforce its own deadline"),
+                if flushed {
+                    TcpCarrierHeartbeatFailure::ReplyTimeout
+                } else {
+                    TcpCarrierHeartbeatFailure::SendProgressTimeout
+                }
+            );
+            assert!(timing.last().is_none());
+        }
+    }
 
     fn owner_at(start: tokio::time::Instant) -> Arc<TcpCarrierHeartbeat> {
         Arc::new(TcpCarrierHeartbeat::new(

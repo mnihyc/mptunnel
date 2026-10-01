@@ -233,8 +233,10 @@
 # max_response_prefetch_bytes = 1048576
 
 # TCP record heartbeats and native QUIC liveness are separate carrier
-# mechanisms. The interval is the maximum idle delay; clients renew each idle
-# probe within 80%-100% of it. Both remain below logical session retention.
+# mechanisms. Intervals renew within 80%-100% of the maximum delay. TCP also
+# samples authenticated peer RTT at that cadence during traffic; QUIC uses native
+# idle liveness. TCP peer samples expire after interval + timeout, independently
+# of local socket RTT. Both remain below logical session retention.
 #| tcp_path_heartbeat_interval_s = 10
 #| tcp_path_heartbeat_timeout_s = 30
 #| quic_path_keep_alive_interval_s = 10

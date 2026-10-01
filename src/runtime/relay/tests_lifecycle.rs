@@ -1131,7 +1131,7 @@ fn response_stall_anchor_ignores_unrelated_request_progress() {
 #[test]
 fn repeated_stall_attempts_use_a_future_bounded_deadline() {
     let started = Instant::now();
-    let pto = transport_pto_from_snapshot(None);
+    let pto = peer_pto_from_snapshot(None);
     assert_eq!(
         reliable_relay_product_stall_deadline(started, None, None),
         tokio::time::Instant::from_std(started + pto),

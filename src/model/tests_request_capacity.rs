@@ -104,7 +104,7 @@ fn request_tcp_capacity_lease_is_derived_from_growth_service_and_recovery() {
     let candidate = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 180.0, 1_000_000.0);
     let train_bytes = 4_813_080;
     let reference_rate_bps = 100_000_000;
-    let pto = transport_pto_from_snapshot(Some(candidate));
+    let pto = peer_pto_from_snapshot(Some(candidate));
     let growth = pto.saturating_mul(request_capacity_slow_start_rounds(train_bytes));
     let reference_transfer =
         Duration::from_secs_f64(train_bytes as f64 * 8.0 / reference_rate_bps as f64);

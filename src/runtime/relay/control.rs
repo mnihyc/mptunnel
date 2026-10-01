@@ -48,7 +48,7 @@ use crate::model::capacity::{
     reliable_relay_sender_dispatch_budget, reliable_stream_initial_advertised_window_bytes,
 };
 use crate::model::multipath::{LiveOwnerRecoveryWake, live_owner_recovery_wake};
-use crate::model::timing::{sender_service_retry_delay, transport_pto_from_snapshot};
+use crate::model::timing::{peer_pto_from_snapshot, sender_service_retry_delay};
 use crate::mux::stream::{ReliableRecvStream, ReliableSendStream};
 use crate::performance::MppPerformanceConfig;
 #[cfg(feature = "lab-diagnostics")]
@@ -439,9 +439,7 @@ fn begin_client_relay_path_error<'a>(
         Some(ClientRelayPathErrorSettlement {
             instance,
             retry_at: tokio::time::Instant::now()
-                + transport_pto_from_snapshot(
-                    context.reliable_path_snapshot_for_instance(instance),
-                ),
+                + peer_pto_from_snapshot(context.reliable_path_snapshot_for_instance(instance)),
         })
     };
     // Only exact identity, its original retry time, and Native inputs cross

@@ -6,6 +6,7 @@
 use super::model::{
     ClientPathObservation, UdpDatagramPathObservation, path_record_failure_cooldown,
 };
+use super::peer_round_trip::{PeerRoundTripObservation, PeerRoundTripSource};
 use super::proof::PathProofObservation;
 use super::quic::metrics::UdpPathMetrics;
 use super::tcp::capacity::RequestTcpCapacityRecord;
@@ -28,6 +29,7 @@ use crate::runtime::path::CarrierNativeWindowSample;
 use crate::runtime::path::authority::NativeCarrierSchedulingShapeSnapshot;
 use crate::scheduler::{PathState as SchedulerPathState, TrafficClass};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -50,6 +52,8 @@ pub(super) enum RelayPathLoadOwner {
 
 #[derive(Debug)]
 pub(in crate::runtime) struct ClientPathHealthRecord {
+    pub(super) peer_round_trip: Option<PeerRoundTripObservation>,
+    pub(super) peer_timing: Option<Arc<super::peer_round_trip::PeerRoundTrip>>,
     pub(in crate::runtime) native_delivery: Option<crate::protocol::NativeDeliverySnapshot>,
     pub(in crate::runtime) state: SchedulerPathState,
     pub(in crate::runtime) manual_disabled: bool,
@@ -225,6 +229,8 @@ struct SuccessfulPathProof {
 impl Default for ClientPathHealthRecord {
     fn default() -> Self {
         Self {
+            peer_round_trip: None,
+            peer_timing: None,
             state: SchedulerPathState::Active,
             manual_disabled: false,
             data_plane_failure_instance_id: None,
@@ -383,6 +389,20 @@ impl ClientPathHealth {
 }
 
 impl ClientPathHealthRecord {
+    pub(in crate::runtime) fn last_peer_round_trip(&self) -> Option<PeerRoundTripObservation> {
+        self.peer_timing
+            .as_ref()
+            .and_then(|timing| timing.last())
+            .or(self.peer_round_trip)
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime) fn set_peer_timing_for_test(&mut self, srtt_ms: f64, rttvar_ms: f64) {
+        self.peer_timing = Some(super::peer_round_trip::PeerRoundTrip::for_test(
+            srtt_ms, rttvar_ms,
+        ));
+    }
+
     fn current_timing_scope(&self) -> Option<DirectionalServiceRateScope> {
         self.path_instance_id.map(|path_instance_id| {
             DirectionalServiceRateScope::new(path_instance_id, PathMetricDirection::ClientToServer)
@@ -1012,6 +1032,10 @@ impl ClientPathHealthRecord {
             })
             .unwrap_or(0);
         ClientPathObservation {
+            peer_timing: self
+                .peer_timing
+                .as_ref()
+                .and_then(|timing| timing.timing_at(now)),
             native_delivery: self.native_delivery,
             state,
             manual_disabled: self.manual_disabled,
@@ -1069,8 +1093,20 @@ impl ClientPathHealthRecord {
             active_latency_sensitive_flows: self.active_latency_sensitive_flows,
             relay_bytes_in_flight: self.relay_bytes_in_flight,
             relay_queue_bytes: self.relay_queue_bytes,
-            carrier_srtt_ms: self.carrier_srtt_ms,
-            carrier_rttvar_ms: self.carrier_rttvar_ms,
+            // Consume the accepted coherent native tuple, including absent
+            // variation. An older/rejected publication cannot mix its scalar
+            // fields into the current projection.
+            carrier_srtt_ms: self
+                .carrier_timing
+                .map(|timing| timing.round_trip_time().as_secs_f64() * 1000.0)
+                .or(self.carrier_srtt_ms),
+            carrier_rttvar_ms: self
+                .carrier_timing
+                .map_or(self.carrier_rttvar_ms, |timing| {
+                    timing
+                        .variation()
+                        .map(|variation| variation.as_secs_f64() * 1000.0)
+                }),
             directional_timing: self.carrier_timing.or(self.measured_timing),
             carrier_loss_rate: self.carrier_loss_rate,
             carrier_ecn_rate: self.carrier_ecn_rate,
@@ -1165,6 +1201,28 @@ impl ClientPathHealthRecord {
         true
     }
 
+    /// Only the authenticated readiness exchange has this observation scope.
+    /// Generic product-open success may include target dialing and must not be
+    /// relabeled as a peer round trip.
+    pub(in crate::runtime) fn mark_readiness_round_trip_for_instance(
+        &mut self,
+        path_instance_id: CarrierPathInstanceId,
+        elapsed: Duration,
+    ) -> bool {
+        if !self.mark_success_for_instance(path_instance_id, elapsed) {
+            return false;
+        }
+        if self.peer_timing.is_none() {
+            PeerRoundTripObservation::accept(
+                &mut self.peer_round_trip,
+                elapsed,
+                Instant::now(),
+                PeerRoundTripSource::Readiness,
+            );
+        }
+        true
+    }
+
     fn record_success(&mut self, elapsed: Duration) {
         self.record_success_diagnostics(elapsed);
         self.publish_measured_timing(None);
@@ -1190,6 +1248,22 @@ impl ClientPathHealthRecord {
             return false;
         }
         self.mark_success(observation.elapsed);
+        if let Some(observed_at) = observation.sent_at.checked_add(observation.elapsed) {
+            if let Some(timing) = &self.peer_timing {
+                timing.record(
+                    observation.elapsed,
+                    observed_at,
+                    PeerRoundTripSource::PathProof,
+                );
+            } else {
+                PeerRoundTripObservation::accept(
+                    &mut self.peer_round_trip,
+                    observation.elapsed,
+                    observed_at,
+                    PeerRoundTripSource::PathProof,
+                );
+            }
+        }
         self.path_proof_success = true;
         let proof = SuccessfulPathProof {
             proof_id: observation.proof_id,
@@ -1541,8 +1615,11 @@ impl ClientPathHealthRecord {
         self.mark_liveness_success();
         self.product_delivery_samples = self.product_delivery_samples.saturating_add(1);
         self.product_last_delivery_at = Some(now);
-        self.product_delivery_rate_expires_at =
-            now.checked_add(self.rate_sample_freshness_horizon());
+        let horizon = self.peer_timing.as_ref().map_or_else(
+            || self.rate_sample_freshness_horizon(),
+            |timing| timing.timing_or_prior_at(now).rate_freshness_horizon(),
+        );
+        self.product_delivery_rate_expires_at = now.checked_add(horizon);
     }
 
     pub(in crate::runtime) fn mark_product_delivery_for_instance(
@@ -1881,6 +1958,8 @@ impl ClientPathHealthRecord {
     }
 
     fn clear_physical_carrier_state(&mut self) {
+        self.peer_round_trip = None;
+        self.peer_timing = None;
         self.data_plane_failure_instance_id = None;
         self.wire_path_id = None;
         self.peer_usage = None;

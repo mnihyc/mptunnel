@@ -12,8 +12,7 @@ use crate::model::capacity::{
 };
 use crate::model::path::RelayPathKey;
 use crate::model::timing::{
-    path_open_pto, path_open_pto_multiplier, path_open_serialized_exchanges,
-    transport_pto_from_snapshot,
+    path_open_pto, path_open_pto_multiplier, path_open_serialized_exchanges, peer_pto_from_snapshot,
 };
 use crate::protocol::{
     Frame, PathMetrics, PathUsage, StreamAttachmentPhase, StreamDemandHint, StreamId,
@@ -924,7 +923,7 @@ pub(in crate::runtime) fn reliable_relay_attach_open_timeouts(
     key: RelayPathKey,
 ) -> ReliableRelayAttachOpenTimeouts {
     let snapshot = context.reliable_path_snapshot(key);
-    let live = transport_pto_from_snapshot(snapshot);
+    let live = peer_pto_from_snapshot(snapshot);
     let setup = match key.underlay {
         UnderlayProtocol::Tcp => {
             // A cold lane-class actor owns carrier dial, authenticated path

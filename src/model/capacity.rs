@@ -526,7 +526,7 @@ fn reliable_path_product_bdp_bytes(path: PathSnapshot) -> f64 {
             .unwrap_or(path.delivery_rate_bps),
     );
     let rate_bps = rate_bps.max(1.0);
-    (rate_bps / 8.0) * (path.srtt_ms.max(1.0) / 1000.0)
+    (rate_bps / 8.0) * (path.peer_timing().srtt_ms().max(1.0) / 1000.0)
 }
 
 fn min_reliable_service_quantum_bytes(mux_limits: MuxLimits) -> usize {

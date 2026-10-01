@@ -2825,7 +2825,11 @@ async fn client_duplicate_committed_response_fin_does_not_reopen_fin_debt() {
             tokio::select! {
                 result = &mut relay => break result.expect("relay task join"),
                 command = recv_reliable_path_command(&mut receivers) => {
-                    let command = command.expect("carrier remains live through cleanup");
+                    // Completion drops the carrier before the JoinHandle need
+                    // become ready in this select. Observe the actual result.
+                    let Some(command) = command else {
+                        break (&mut relay).await.expect("relay task join");
+                    };
                     receivers.release_pending_command_bytes(
                         crate::runtime::path::commands::reliable_path_command_pending_bytes(&command),
                     );

@@ -765,8 +765,7 @@ impl ClientTcpPathSessionHandle {
         let readiness_rtt = connection.carrier.readiness_rtt;
         apply_authenticated_readiness_to_startup_evidence(
             &mut connection.startup_snapshot,
-            &mut connection.startup_metrics,
-            readiness_rtt,
+            &connection.carrier.peer_timing.reader(),
         );
         let successor_instance_id = connection.path_instance_id;
         let successor_port = connection.carrier.remote_port;

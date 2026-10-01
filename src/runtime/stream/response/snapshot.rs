@@ -35,7 +35,7 @@ use crate::scheduler::{PathRateScope, PathSnapshot, TrafficClass};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::sync::Notify;
 
@@ -361,30 +361,18 @@ pub(super) fn server_bulk_output_snapshot_at(
         .flatten();
     let liveness_metrics = local_metrics.or(peer_hint);
 
-    let proof_rtt = entry.path_proof.filter(|observation| {
-        let proof_acked_at = observation
-            .sent_at
-            .checked_add(observation.elapsed)
-            .unwrap_or(observation.sent_at);
-        local_metrics.is_none_or(|metrics| metrics.recorded_at < proof_acked_at)
+    // Local sender telemetry (or its explicit startup prior) describes the
+    // transport. PATH_PROOF and Product elapsed time cannot replace its RTT.
+    let transport_metrics = if entry.key.underlay == crate::protocol::UnderlayProtocol::Tcp {
+        local_metrics
+    } else {
+        liveness_metrics
+    };
+    let srtt_ms = transport_metrics.map_or_else(default_path_srtt_ms, |metrics| {
+        f64::from(metrics.metrics.srtt_us.max(1)) / 1000.0
     });
-    let srtt_ms = proof_rtt.map_or_else(
-        || {
-            liveness_metrics.map_or_else(
-                || entry.srtt_ms.unwrap_or_else(default_path_srtt_ms),
-                |metrics| f64::from(metrics.metrics.srtt_us.max(1)) / 1000.0,
-            )
-        },
-        |observation| {
-            observation
-                .elapsed
-                .max(Duration::from_micros(1))
-                .as_secs_f64()
-                * 1000.0
-        },
-    );
     let jitter_ms =
-        liveness_metrics.map_or(0.0, |metrics| f64::from(metrics.metrics.jitter_us) / 1000.0);
+        transport_metrics.map_or(0.0, |metrics| f64::from(metrics.metrics.rttvar_us) / 1000.0);
     let loss_rate = liveness_metrics
         .filter(|metrics| metrics.metrics.loss_observed)
         .map_or(0.0, |metrics| {
@@ -503,6 +491,23 @@ pub(super) fn server_bulk_output_snapshot_at(
         srtt_ms,
         rate_bps.max(1.0),
     );
+    let transport = if transport_metrics.is_some() {
+        crate::model::timing::TransportTiming::new(srtt_ms, jitter_ms)
+    } else {
+        crate::model::timing::TransportTiming::prior(srtt_ms, jitter_ms)
+    };
+    snapshot.set_timing(
+        if snapshot.underlay == crate::protocol::UnderlayProtocol::Tcp {
+            crate::model::timing::PathTiming::tcp(
+                transport,
+                entry.commands.peer_timing_at(now).unwrap_or(
+                    crate::model::timing::PeerTiming::prior(default_path_srtt_ms(), 0.0),
+                ),
+            )
+        } else {
+            crate::model::timing::PathTiming::quic(transport)
+        },
+    );
     snapshot.scheduling_service_rate = scheduling_service_rate;
     snapshot.rate_scope = rate_scope;
     if scheduling_service_rate.is_none() {
@@ -535,7 +540,6 @@ pub(super) fn server_bulk_output_snapshot_at(
     // Numeric completion service may expire independently without returning
     // this output to the unproven startup-flight tier.
     snapshot.has_durable_product_progress = entry.product_qualification.qualified();
-    snapshot.jitter_ms = jitter_ms;
     snapshot.loss_rate = loss_rate;
     if let Some(metrics) = local_metrics {
         if let Some(pacing_rate_bps) = native_pacing_rate {
@@ -644,7 +648,13 @@ pub(super) fn server_native_bulk_output_snapshot_at(
             .then_some(finite_rate_bps)
             .flatten()
             .map(|rate| rate as f64);
-        snapshot.jitter_ms = shape.rttvar().as_secs_f64() * 1_000.0;
+        snapshot.set_timing(crate::model::timing::PathTiming::quic(
+            crate::model::timing::TransportTiming::from_native_or_prior(
+                shape.srtt(),
+                shape.rttvar(),
+                snapshot.transport_timing(),
+            ),
+        ));
         snapshot.pacing_rate_bps = shape
             .pacing_rate_bps()
             .or(finite_rate_bps)

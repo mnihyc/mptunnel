@@ -539,7 +539,11 @@ async fn run_client_tcp_path_session_active(
                         runtime.path_index,
                         connection.path_instance_id.as_u64(),
                     );
+                    #[cfg(test)]
+                    let retiring_instance = connection.path_instance_id;
                     retire_failed_client_tcp_connection(runtime, state, carrier_readiness);
+                    #[cfg(test)]
+                    pause_native_retirement_for_test(runtime, retiring_instance).await;
                     actor_terminal.finish();
                     return;
                 }
@@ -980,24 +984,28 @@ async fn run_client_tcp_path_session_active(
                 .path_instance_id;
             retire_failed_client_tcp_connection(runtime, state, carrier_readiness);
             #[cfg(test)]
-            {
-                // Pause only the selected physical owner's actual cleanup,
-                // without holding the hook lock or native connection alive.
-                let pause = runtime
-                    .native_retirement_pause
-                    .lock()
-                    .expect("test native retirement pause lock")
-                    .take_if(|pause| pause.path_instance_id == retiring_instance);
-                if let Some(pause) = pause {
-                    let _ = pause.reached.send(retiring_instance);
-                    // Fixture cancellation drops the sender and releases this
-                    // await just as explicit completion does.
-                    let _ = pause.release.await;
-                }
-            }
+            pause_native_retirement_for_test(runtime, retiring_instance).await;
             actor_terminal.finish();
             return;
         }
+    }
+}
+
+#[cfg(test)]
+async fn pause_native_retirement_for_test(
+    runtime: &ClientTcpPathSessionRuntime,
+    retiring_instance: CarrierPathInstanceId,
+) {
+    // Both native readers and native write admission can discover the same
+    // terminal socket. Hold their common readiness-cleared lifetime boundary.
+    let pause = runtime
+        .native_retirement_pause
+        .lock()
+        .expect("test native retirement pause lock")
+        .take_if(|pause| pause.path_instance_id == retiring_instance);
+    if let Some(pause) = pause {
+        let _ = pause.reached.send(retiring_instance);
+        let _ = pause.release.await;
     }
 }
 
@@ -1757,19 +1765,16 @@ pub(in crate::runtime::path::tcp) async fn connect_client_tcp_path(
     ))
 }
 
-/// Warms only the connection-local timing prior from this exact carrier's
-/// authenticated readiness exchange. Immutable configured jitter/rate hints
-/// remain intact; no predecessor or native TCP state enters the successor.
+/// Projects this exact carrier's coherent peer estimate into its startup
+/// snapshot. Native timing and the configured rate retain their own scope.
 pub(super) fn apply_authenticated_readiness_to_startup_evidence(
     snapshot: &mut crate::scheduler::PathSnapshot,
-    metrics: &mut crate::protocol::PathMetrics,
-    readiness_rtt: Duration,
+    peer_timing: &crate::runtime::path::peer_round_trip::PeerRoundTripReader,
 ) {
-    let srtt_us = u32::try_from(readiness_rtt.as_micros())
-        .unwrap_or(u32::MAX)
-        .max(1);
-    snapshot.srtt_ms = f64::from(srtt_us) / 1_000.0;
-    metrics.srtt_us = srtt_us;
+    snapshot.set_timing(crate::model::timing::PathTiming::tcp(
+        snapshot.transport_timing(),
+        peer_timing.timing_at(std::time::Instant::now()),
+    ));
 }
 
 fn publish_client_tcp_connection(
@@ -1827,6 +1832,7 @@ pub(in crate::runtime::path::tcp) fn publish_client_tcp_connection_committed(
             peer_usage_sequence: connection.carrier.peer_usage_sequence,
             peer_usage: connection.carrier.peer_usage,
             readiness_rtt,
+            peer_timing: Some(connection.carrier.peer_timing.clone()),
             local_addr: connection.carrier.local_addr,
             peer_addr: connection.carrier.peer_addr,
         },
@@ -1862,6 +1868,7 @@ pub(in crate::runtime::path::tcp) fn publish_client_tcp_replacement_connection_c
             peer_usage_sequence: connection.carrier.peer_usage_sequence,
             peer_usage: connection.carrier.peer_usage,
             readiness_rtt,
+            peer_timing: Some(connection.carrier.peer_timing.clone()),
             local_addr: connection.carrier.local_addr,
             peer_addr: connection.carrier.peer_addr,
         },
@@ -2350,18 +2357,26 @@ mod tests {
             .expect("TCP path with configured startup priors");
         let path_id = crate::protocol::PathId(37);
         let mut snapshot = path_startup_snapshot(&path, path_id);
-        let mut metrics = path_startup_metrics(&path, path_id, PathMetricDirection::ClientToServer);
+        let metrics = path_startup_metrics(&path, path_id, PathMetricDirection::ClientToServer);
 
-        apply_authenticated_readiness_to_startup_evidence(
-            &mut snapshot,
-            &mut metrics,
+        let timing = Arc::new(crate::runtime::path::peer_round_trip::PeerRoundTrip::new(
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            snapshot.peer_timing(),
+        ));
+        timing.record(
             Duration::from_millis(42),
+            std::time::Instant::now(),
+            crate::runtime::path::peer_round_trip::PeerRoundTripSource::Readiness,
         );
+        apply_authenticated_readiness_to_startup_evidence(&mut snapshot, &timing.reader());
 
-        assert_eq!(snapshot.srtt_ms, 42.0);
-        assert_eq!(snapshot.jitter_ms, 125.0);
+        assert_eq!(snapshot.peer_timing().srtt_ms(), 42.0);
+        assert_eq!(snapshot.peer_timing().rttvar_ms(), 21.0);
+        assert_eq!(snapshot.transport_timing().rttvar_ms(), 125.0);
         assert_eq!(snapshot.delivery_rate_bps, 420_000_000.0);
-        assert_eq!(metrics.srtt_us, 42_000);
+        assert_eq!(metrics.srtt_us, 750_000);
+        assert_eq!(snapshot.transport_timing().srtt_ms(), 750.0);
         assert_eq!(metrics.rttvar_us, 125_000);
         assert_eq!(
             metrics.delivery_rate_bps,

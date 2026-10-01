@@ -669,30 +669,32 @@ Section 13.
 
 One TCP carrier instance multiplexes path control, stream attachments, and
 datagram-flow attachments. `PING` and `PONG` may provide MPP-level heartbeat.
-Either TCP endpoint may initiate an idle heartbeat independently. The configured
-interval `I` is the maximum receive-idle delay, not a periodic wire cadence. At
-connection start and after each completed idle heartbeat, the endpoint selects a
+Either TCP endpoint may initiate a heartbeat independently. The configured
+interval `I` bounds both receive-idle delay and periodic peer-timing discovery.
+At connection start and after each completed heartbeat, the endpoint selects a
 fresh cryptographically random delay uniformly from `[0.8I, I]`. Authenticated
-frames received on that exact carrier defer the current delay without drawing
-another value, provided no challenge has started. Locally queuing or writing
-bytes and activity on sibling carriers MUST NOT renew receive-idle liveness.
+frames on that exact carrier defer receive-idle expiry while no challenge is
+outstanding, but MUST NOT defer the timing observation indefinitely. Local writes
+and activity on sibling carriers do not renew receive-idle liveness. The server,
+which has no measured readiness round trip, schedules its first challenge at
+carrier publication; the client seeds timing from authenticated readiness.
 
 Each endpoint owns at most one outstanding challenge on each carrier. When a
-due probe is claimed for the serialized writer, its nonce and absolute deadline
-become fixed. The deadline is the idle due time plus the configured heartbeat
-timeout; it includes waiting for writer service, transmission, and receipt of the
-reply. Deadline enforcement MUST remain active while ordinary writes or a
-heartbeat write are blocked, including before the writer can claim the probe.
-At a writer arbitration boundary, a due probe takes precedence over ordinary
-outgoing work; a continuously ready sender MUST NOT starve its own liveness check.
-Other authenticated traffic MUST NOT extend an outstanding challenge. A late
-wake coalesces missed timer work into at most one probe, never a catch-up burst
-or a fresh timeout budget. Subject to runtime scheduling, receive inactivity is
-therefore bounded by `I` plus the configured heartbeat timeout.
+due probe is claimed for the serialized writer, its nonce, send-attempt time and
+absolute deadline become fixed. An idle probe retains its idle-due-plus-timeout
+bound, including delayed writer service. A timing probe on an otherwise active
+carrier starts its budget at the send attempt, clipped by an earlier idle
+bound. Neither periodic discovery nor a late wake invents an earlier liveness
+failure. Deadline enforcement remains active while writes are blocked. A due
+probe takes precedence at writer arbitration. Other authenticated traffic cannot
+extend an outstanding challenge. Missed timing opportunities coalesce into one
+probe, never a catch-up burst. Subject to runtime scheduling, receive inactivity
+remains bounded by `I` plus the configured heartbeat timeout.
 
 A receiver of `PING(nonce)` returns exactly `PONG(nonce)` in the opposite
 direction on the same bidirectional reliable carrier operation; a PONG grants
-no Product, flow-control, delivery, or rate evidence. Only a matching PONG
+no Product, flow-control, delivery, or rate evidence. Its correlated elapsed
+time from the send attempt is peer timing, not native RTT or target latency. Only a matching PONG
 authenticated and applied to that exact carrier's liveness owner before its
 deadline completes the challenge. The authenticated reader applies this receipt
 synchronously before actor queueing. Receipt, accepted drain, and expiry share
@@ -2268,15 +2270,49 @@ interpret the canonical tie key as fairness state. A carrier known to share a
 saturated bottleneck may legitimately provide no marginal service; bounded
 exploration is required only while that marginal opportunity remains unknown.
 
+For TCP, a socket RTT ends at the transport peer, which may be a terminating
+relay. MPP completion ranking and Data-ACK recovery MUST instead use locally
+correlated authenticated exchanges on the exact MPP carrier, or the declared
+startup timing when no fresh peer observation exists. Generic Product-open
+elapsed time can include destination work; a Data ACK can return over another
+carrier. Neither is a same-carrier RTT sample. Native timing remains authoritative
+for native transport shape and diagnostics. Native QUIC timing reaches its
+cryptographically authenticated QUIC endpoint and retains its transport scope.
+
+TCP peer SRTT and RTT variation form one estimator: the first sample initializes
+SRTT to the sample and variation to half that sample; subsequent samples use the
+RFC 6298 paired updates (alpha 1/8, beta 1/4, variation using the previous SRTT).
+The first steady heartbeat or PathProof replaces the readiness bootstrap rather
+than retaining admission delay in steady timing. After one configured heartbeat
+interval plus its timeout without a sample, ranking uses the startup prior and
+the next accepted exchange restarts the estimator. The last diagnostic sample
+keeps its original observation time and source even when stale. Peer timing does
+not change immutable Product assignment epochs, ownership, credit or native
+write admission. Product delivery-rate epochs freeze their existing three-PTO
+freshness horizon using peer timing; native rate epochs retain native timing.
+Later timing samples cannot extend either epoch's already stored deadline.
+No one-way-delay measurement is inferred from these exchanges.
+
+Timing is projected at the producer boundary. A path's transport and MPP-peer
+views MUST remain distinct immutable values; selecting peer timing MUST NOT
+rewrite a native snapshot. Startup versus observed evidence travels with the
+selected value, so native availability cannot remove a peer startup floor.
+Completion consumers receive only the upstream-selected peer timing, service
+rate, and relevant work. They have no access to native RTT, native pacing, or
+diagnostic rate alternatives. Product outputs hold read-only access to their
+physical carrier's peer estimator; authenticated carrier owners alone record
+exchanges. Product flight/reorder geometry uses peer timing, while native
+buffer admission and native rate epochs continue to use native timing.
+
 Core v11 has no synchronized one-way-delay authority. Its live timing input is
 therefore one exact local tuple `(timing epoch, validated RTT, optional J)`
 bound to the carrier instance and original-sender direction. It projects
 `T = validated RTT / 2`. When J is present it MUST come from that same tuple; a
 newer RTT cannot be combined with an older, configured, or differently scoped
-J. J may be unavailable even when RTT is valid: for example, the Windows
-same-socket TCP API exposes SRTT but not RTT variation. That absence does not
-discard valid RTT, does not mean measured zero, and does not authorize borrowing
-variation from another source. Before a valid live RTT exists, the immutable
+J. Missing variation does not discard an otherwise valid scoped RTT, does not
+mean measured zero, and does not authorize borrowing variation from another
+source. In particular, absence of native RTT variation on a platform does not
+change the independent authenticated peer estimator. Before a valid live RTT exists, the immutable
 configured startup tuple is used, with the portable Section 15.1 values for
 omitted fields. NaN, infinity, negative input, a scope mismatch, or an
 unrepresentable present duration rejects that raw live publication rather than
@@ -3836,8 +3872,9 @@ A scoped Data ACK may establish omitted ranges only inside its own scope.
 Later positive-only ranges extend known progress but establish no omissions.
 
 The MPP recovery interval uses the original carrier's underlay and latest
-snapshot. When that snapshot contains an observation, let `srtt` and `jitter`
-be its nonnegative directional smoothed-RTT and jitter durations:
+snapshot. TCP uses the peer-scoped estimator or declared startup prior above;
+native first-leg RTT must not set a clock for remote MPP progress. Let `srtt` and
+`jitter` be the coherent smoothed RTT and RTT variation for that scope:
 
 - TCP: with an observation, let `SRTT = max(srtt, 1 ms)` and
   `RTTVAR = max(jitter, SRTT / 8)`. The interval is

@@ -493,6 +493,9 @@ impl std::fmt::Debug for ServerDatagramPort {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::runtime) struct ServerCarrierPathStatusSnapshot {
+    pub(in crate::runtime) peer_timing: Option<crate::model::timing::PeerTiming>,
+    pub(in crate::runtime) peer_round_trip:
+        Option<super::peer_round_trip::PeerRoundTripObservation>,
     pub(in crate::runtime) native_delivery: Option<crate::protocol::NativeDeliverySnapshot>,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) underlay: UnderlayProtocol,
@@ -887,6 +890,15 @@ impl ServerPathValidation {
 }
 
 impl ServerCarrierPathRegistration {
+    pub(in crate::runtime) fn bind_peer_timing(
+        &self,
+        timing: Arc<super::peer_round_trip::PeerRoundTrip>,
+    ) {
+        self.inner
+            .backend
+            .bind_peer_timing(self.inner.identity, timing);
+    }
+
     /// Called only after readiness bytes have been accepted and flushed.
     pub(in crate::runtime) fn publish_ready(
         &self,
@@ -1262,6 +1274,12 @@ pub(in crate::runtime) trait ServerStreamPortBackend: Send + Sync {
         &self,
         identity: ServerCarrierPathIdentity,
         shape: NativeCarrierSchedulingShapeSnapshot,
+    );
+
+    fn bind_peer_timing(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        timing: Arc<super::peer_round_trip::PeerRoundTrip>,
     );
 
     fn record_path_proof_success(

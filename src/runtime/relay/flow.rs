@@ -2,7 +2,7 @@ use crate::model::capacity::{
     MIN_RELIABLE_PIPE_PACKETS, PATH_OPEN_SCORE_BYTES, QUIC_TIMER_GRANULARITY,
     reliable_relay_buffer_len, reliable_relay_scheduler_quantum_cap,
 };
-use crate::model::timing::transport_pto_from_snapshot;
+use crate::model::timing::peer_pto_from_snapshot;
 use crate::mux::MuxLimits;
 use crate::scheduler::{PathSnapshot, TrafficClass};
 use std::time::{Duration, Instant};
@@ -254,7 +254,7 @@ fn reliable_flow_bulk_rate_threshold_bps(path: Option<PathSnapshot>, mux_limits:
     let service_quantum =
         reliable_relay_scheduler_quantum_cap(path, TrafficClass::Throughput, mux_limits).max(1);
     service_quantum as f64 * 8.0
-        / transport_pto_from_snapshot(path)
+        / peer_pto_from_snapshot(path)
             .as_secs_f64()
             .max(QUIC_TIMER_GRANULARITY.as_secs_f64())
 }
@@ -271,7 +271,7 @@ fn reliable_flow_rate_bulk_evidence_bytes(
 }
 
 fn reliable_flow_interactive_idle_gap(path: Option<PathSnapshot>) -> Duration {
-    transport_pto_from_snapshot(path)
+    peer_pto_from_snapshot(path)
 }
 
 fn reliable_flow_rebalance_interval(path: Option<PathSnapshot>) -> Duration {
@@ -309,7 +309,8 @@ pub(in crate::runtime) fn reliable_flow_bulk_threshold_bytes(
     let service_quantum =
         reliable_relay_scheduler_quantum_cap(path, TrafficClass::Throughput, mux_limits) as u64;
     let bdp_bytes = path.map_or(relay_chunk, |path| {
-        ((path.delivery_rate_bps.max(1.0) / 8.0) * (path.srtt_ms.max(1.0) / 1000.0)).ceil() as u64
+        ((path.delivery_rate_bps.max(1.0) / 8.0) * (path.peer_timing().srtt_ms().max(1.0) / 1000.0))
+            .ceil() as u64
     });
     bdp_bytes
         .max(service_quantum)

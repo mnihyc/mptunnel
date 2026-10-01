@@ -1293,20 +1293,32 @@ async fn datagram_product_open_deadline_does_not_fail_the_live_udp_carrier() {
     let mut association = DatagramClientAssociation::new(context.clone())
         .await
         .expect("datagram association");
+    // Exercise stream-credit exhaustion, not the earlier TTL eligibility
+    // filter. The carrier can still have startup timing before its first
+    // native RTT publication, even though its control stream is established.
+    let snapshot = context
+        .udp_path_snapshot(0)
+        .expect("ready carrier snapshot");
+    let budget = snapshot.peer_timing().pto() + Duration::from_millis(100);
+    let ttl_ms = u32::try_from(budget.as_millis()).expect("loopback Product budget");
     let started_at = tokio::time::Instant::now();
     let error = association
         .send_to_fresh_datagram_with_policy(
             TargetAddr::Ip(target.local_addr().expect("UDP target address")),
             Bytes::from_static(b"stream-credit deadline"),
-            100,
+            ttl_ms,
             None,
             TrafficClass::RealtimeDatagram,
         )
         .await
         .expect_err("the sole QUIC bidi credit remains owned by the control stream");
-    assert!(matches!(error, RuntimeError::PathOpenTimedOut));
     assert!(
-        started_at.elapsed() < Duration::from_secs(1),
+        matches!(error, RuntimeError::PathOpenTimedOut),
+        "unexpected stream-credit deadline outcome: {error:?}"
+    );
+    assert_eq!(context.datagram_candidate_attempts_for_test(), 1);
+    assert!(
+        started_at.elapsed() < budget + Duration::from_secs(1),
         "the operation-local Product deadline bounds outer association settlement",
     );
 
@@ -2719,7 +2731,10 @@ fn fixed_response_output_inherits_path_startup_evidence() {
     assert_eq!(inherited.id, startup.id);
     assert_eq!(inherited.underlay, startup.underlay);
     assert_eq!(inherited.delivery_rate_bps, startup.delivery_rate_bps);
-    assert_eq!(inherited.srtt_ms, startup.srtt_ms);
+    assert_eq!(
+        inherited.transport_timing().srtt_ms(),
+        startup.transport_timing().srtt_ms()
+    );
     assert_eq!(
         adaptive_reliable_relay_chunk_bytes(Some(inherited), TrafficClass::Throughput, mux_limits),
         adaptive_reliable_relay_chunk_bytes(Some(default), TrafficClass::Throughput, mux_limits),
@@ -3751,8 +3766,9 @@ fn reliable_flow_demand_promotes_lane_after_runtime_bdp_threshold() {
     let threshold = reliable_flow_bulk_threshold_bytes(Some(path), mux_limits);
     let high_bdp_path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 180.0, 300_000_000.0);
     let high_bdp_threshold = reliable_flow_bulk_threshold_bytes(Some(high_bdp_path), mux_limits);
-    let high_bdp =
-        ((high_bdp_path.delivery_rate_bps / 8.0) * (high_bdp_path.srtt_ms / 1000.0)).ceil() as u64;
+    let high_bdp = ((high_bdp_path.delivery_rate_bps / 8.0)
+        * (high_bdp_path.transport_timing().srtt_ms() / 1000.0))
+        .ceil() as u64;
     let mut state = ReliableRelayFlowDemandTracker::new();
 
     assert!(
@@ -4595,7 +4611,7 @@ fn tcp_receive_hole_reinjection_tracks_buffered_ordering_gap() {
 fn tcp_receive_hole_reinjection_deadline_is_progress_signal_not_path_victim_policy() {
     let now = Instant::now();
     let mut path = PathSnapshot::new(PathId(1), UnderlayProtocol::Tcp, 50.0, 100_000_000.0);
-    path.jitter_ms = 5.0;
+    path.set_rttvar_for_test(5.0);
     path.carrier_inflight_limit_bytes = 1_000_000;
 
     let deadline = reliable_relay_receive_hole_reinjection_deadline(
@@ -4814,7 +4830,7 @@ fn server_response_output_inherits_open_path_startup_prior_and_metrics() {
         .expect("switchable output exposes seeded path model");
 
     assert_eq!(snapshot.delivery_rate_bps, 500_000_000.0);
-    assert_eq!(snapshot.srtt_ms, 20.0);
+    assert_eq!(snapshot.transport_timing().srtt_ms(), 20.0);
     assert!(
         adaptive_reliable_relay_chunk_bytes(
             Some(snapshot),

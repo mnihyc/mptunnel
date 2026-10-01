@@ -597,7 +597,9 @@ pub(in crate::runtime::path::tcp) async fn handle_client_tcp_stream_frame(
                     startup: evidence.snapshot,
                     startup_native_window: native_window,
                     startup_metrics: Some(evidence.metrics),
-                    commands: pending.session_commands,
+                    commands: pending
+                        .session_commands
+                        .with_peer_timing(connection.carrier.peer_timing.reader()),
                     mux_limits: runtime.mux_limits,
                     frames,
                 };

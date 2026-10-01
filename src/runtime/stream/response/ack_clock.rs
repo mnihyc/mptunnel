@@ -132,8 +132,21 @@ impl ResponseAckClockRateEvidence {
     }
 }
 
-fn response_product_rate_freshness_horizon(entry: &ResponseStreamOutputEntry) -> Duration {
-    // Capture the local carrier timing visible in this exact Data-ACK
+fn response_product_rate_freshness_horizon(
+    entry: &ResponseStreamOutputEntry,
+    now: Instant,
+) -> Duration {
+    if entry.key.underlay == crate::protocol::UnderlayProtocol::Tcp {
+        return entry
+            .commands
+            .peer_timing_at(now)
+            .unwrap_or(crate::model::timing::PeerTiming::prior(
+                default_path_srtt_ms(),
+                0.0,
+            ))
+            .rate_freshness_horizon();
+    }
+    // Capture the timing visible in this exact Data-ACK
     // transaction. The resulting epoch stores an absolute deadline, so later
     // transport-shape polls cannot rewrite its authority.
     let (srtt, rttvar) = server_output_local_path_metrics(entry).map_or_else(
@@ -164,7 +177,7 @@ fn install_response_product_rate_epoch(
     sample_bytes: u64,
     now: Instant,
 ) {
-    let freshness_horizon = response_product_rate_freshness_horizon(entry);
+    let freshness_horizon = response_product_rate_freshness_horizon(entry, now);
     entry.product_rate_epoch =
         ResponseProductRateEpoch::new(rate_bps, sample_count, sample_bytes, now, freshness_horizon);
 }

@@ -15,6 +15,149 @@ const TCP_MIN_RETRANSMISSION_TIMEOUT: Duration = Duration::from_millis(200);
 const TCP_INITIAL_RETRANSMISSION_TIMEOUT: Duration = Duration::from_secs(1);
 const MPTCP_STALE_LOSS_COUNT: u32 = 4;
 
+/// A coherent round-trip pair to the native transport endpoint. It is never
+/// implicitly convertible to MPP timing: TCP can terminate at a relay.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TransportTiming {
+    srtt_ms: f64,
+    rttvar_ms: f64,
+    observed: bool,
+}
+
+impl TransportTiming {
+    /// Native providers use zero before obtaining a round-trip observation.
+    /// Keep the entire startup pair and its provenance in that case.
+    pub(crate) fn from_native_or_prior(srtt: Duration, rttvar: Duration, prior: Self) -> Self {
+        if srtt.is_zero() {
+            prior
+        } else {
+            Self::new(srtt.as_secs_f64() * 1000.0, rttvar.as_secs_f64() * 1000.0)
+        }
+    }
+
+    pub(crate) const fn new(srtt_ms: f64, rttvar_ms: f64) -> Self {
+        Self {
+            srtt_ms,
+            rttvar_ms,
+            observed: true,
+        }
+    }
+
+    pub(crate) const fn prior(srtt_ms: f64, rttvar_ms: f64) -> Self {
+        Self {
+            srtt_ms,
+            rttvar_ms,
+            observed: false,
+        }
+    }
+
+    pub(crate) const fn is_observed(self) -> bool {
+        self.observed
+    }
+
+    pub(crate) const fn srtt_ms(self) -> f64 {
+        self.srtt_ms
+    }
+    pub(crate) const fn rttvar_ms(self) -> f64 {
+        self.rttvar_ms
+    }
+
+    pub(crate) fn pto(self) -> Duration {
+        let srtt = self.srtt_ms.max(1.0);
+        transport_pto_from_ms(srtt, self.rttvar_ms.max(srtt / 8.0))
+    }
+}
+
+/// MPP peer timing selected by its owner, after freshness and startup policy.
+/// This projection deliberately exposes no transport estimate, counters, or
+/// choice of fallback. Consumers cannot choose a different measurement scope.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PeerTiming {
+    srtt_ms: f64,
+    rttvar_ms: f64,
+    observed: bool,
+}
+
+impl PeerTiming {
+    pub(crate) const fn new(srtt_ms: f64, rttvar_ms: f64) -> Self {
+        Self {
+            srtt_ms,
+            rttvar_ms,
+            observed: true,
+        }
+    }
+
+    pub(crate) const fn prior(srtt_ms: f64, rttvar_ms: f64) -> Self {
+        Self {
+            srtt_ms,
+            rttvar_ms,
+            observed: false,
+        }
+    }
+
+    pub(crate) const fn is_observed(self) -> bool {
+        self.observed
+    }
+
+    pub(crate) const fn srtt_ms(self) -> f64 {
+        self.srtt_ms
+    }
+    pub(crate) const fn rttvar_ms(self) -> f64 {
+        self.rttvar_ms
+    }
+
+    pub(crate) fn pto(self) -> Duration {
+        let srtt = self.srtt_ms.max(1.0);
+        transport_pto_from_ms(srtt, self.rttvar_ms.max(srtt / 8.0))
+    }
+
+    pub(crate) fn rate_freshness_horizon(self) -> Duration {
+        self.pto()
+            .saturating_mul(QUIC_PERSISTENT_CONGESTION_THRESHOLD)
+    }
+}
+
+/// Upstream timing projection. The producer declares the endpoint boundary
+/// once. Its consumers receive a typed view, never a mutable RTT override.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PathTiming {
+    transport: TransportTiming,
+    peer: PeerTiming,
+}
+
+impl PathTiming {
+    pub(crate) const fn tcp(transport: TransportTiming, peer: PeerTiming) -> Self {
+        Self { transport, peer }
+    }
+
+    /// QUIC authentication and transport terminate at the same MPP peer.
+    pub(crate) const fn quic(transport: TransportTiming) -> Self {
+        Self {
+            transport,
+            peer: PeerTiming {
+                srtt_ms: transport.srtt_ms,
+                rttvar_ms: transport.rttvar_ms,
+                observed: transport.is_observed(),
+            },
+        }
+    }
+
+    /// An explicitly unobserved prior, also used by synthetic model fixtures.
+    pub(crate) const fn startup(srtt_ms: f64, rttvar_ms: f64) -> Self {
+        Self::tcp(
+            TransportTiming::prior(srtt_ms, rttvar_ms),
+            PeerTiming::prior(srtt_ms, rttvar_ms),
+        )
+    }
+
+    pub(crate) const fn transport(self) -> TransportTiming {
+        self.transport
+    }
+    pub(crate) const fn peer(self) -> PeerTiming {
+        self.peer
+    }
+}
+
 /// Target-independent clocks for one exact original Product assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReliableDataAckGapTiming {
@@ -65,10 +208,11 @@ pub(crate) fn tcp_retransmission_timeout_from_ms(srtt_ms: f64, rttvar_ms: f64) -
     (srtt + (rttvar * 4).max(QUIC_TIMER_GRANULARITY)).max(TCP_MIN_RETRANSMISSION_TIMEOUT)
 }
 
+#[cfg(test)]
 pub(crate) fn tcp_retransmission_timeout_from_snapshot(path: Option<PathSnapshot>) -> Duration {
     path.map(|path| {
-        let srtt_ms = path.srtt_ms.max(1.0);
-        let rttvar_ms = path.jitter_ms.max(srtt_ms / 8.0);
+        let srtt_ms = path.transport_timing().srtt_ms().max(1.0);
+        let rttvar_ms = path.transport_timing().rttvar_ms().max(srtt_ms / 8.0);
         tcp_retransmission_timeout_from_ms(srtt_ms, rttvar_ms)
     })
     .unwrap_or(TCP_INITIAL_RETRANSMISSION_TIMEOUT)
@@ -83,13 +227,17 @@ pub(crate) fn reliable_data_retransmission_interval(
     path: Option<PathSnapshot>,
 ) -> Duration {
     match underlay.or_else(|| path.map(|path| path.underlay)) {
-        Some(UnderlayProtocol::Tcp) => tcp_retransmission_timeout_from_snapshot(path),
-        Some(UnderlayProtocol::Udp) | None => transport_pto_from_snapshot(path),
+        Some(UnderlayProtocol::Tcp) => path.map_or(TCP_INITIAL_RETRANSMISSION_TIMEOUT, |path| {
+            let timing = path.peer_timing();
+            let srtt = timing.srtt_ms().max(1.0);
+            tcp_retransmission_timeout_from_ms(srtt, timing.rttvar_ms().max(srtt / 8.0))
+        }),
+        Some(UnderlayProtocol::Udp) | None => peer_pto_from_snapshot(path),
     }
 }
 
-/// Data ACK gaps use the carrier's established time-threshold loss model:
-/// TCP RACK uses 5/4 SRTT and QUIC uses the RFC 9002 default 9/8 SRTT.
+/// Data ACK gaps concern the MPP receiver. Preserve the existing 5/4 TCP
+/// and 9/8 QUIC time thresholds, using peer-scoped timing for split TCP.
 pub(crate) fn reliable_data_ack_loss_delay(
     underlay: Option<UnderlayProtocol>,
     path: Option<PathSnapshot>,
@@ -99,7 +247,7 @@ pub(crate) fn reliable_data_ack_loss_delay(
         UnderlayProtocol::Tcp => 5.0 / 4.0,
         UnderlayProtocol::Udp => 9.0 / 8.0,
     };
-    let delay_ms = (path.srtt_ms.max(1.0) * multiplier).max(1.0);
+    let delay_ms = (path.peer_timing().srtt_ms().max(1.0) * multiplier).max(1.0);
     delay_ms
         .is_finite()
         .then(|| Duration::from_secs_f64(delay_ms / 1000.0))
@@ -256,19 +404,17 @@ pub(crate) fn quic_bulk_proof_freshness_horizon(srtt: Duration, rttvar: Duration
 }
 
 pub(crate) fn transport_pto_from_snapshot(path: Option<PathSnapshot>) -> Duration {
-    // PTO follows carrier evidence, not product priority. Lane policy may gate
-    // or size product reinjection, but does not rewrite this timing basis.
-    path.map(|path| {
-        let srtt_ms = path.srtt_ms.max(1.0);
-        let rttvar_ms = path.jitter_ms.max(srtt_ms / 8.0);
-        transport_pto_from_ms(srtt_ms, rttvar_ms)
-    })
-    .unwrap_or_else(default_transport_pto)
+    path.map_or_else(default_transport_pto, |path| path.transport_timing().pto())
+}
+
+/// The MPP projection never receives a native timing fallback.
+pub(crate) fn peer_pto_from_snapshot(path: Option<PathSnapshot>) -> Duration {
+    path.map_or_else(default_transport_pto, |path| path.peer_timing().pto())
 }
 
 pub(crate) fn path_open_pto(path: Option<PathSnapshot>, rtt_is_observed: bool) -> Duration {
-    let path_pto = transport_pto_from_snapshot(path);
-    if rtt_is_observed {
+    let path_pto = peer_pto_from_snapshot(path);
+    if rtt_is_observed && path.is_some_and(|path| path.peer_timing().is_observed()) {
         path_pto
     } else {
         path_pto.max(default_transport_pto())

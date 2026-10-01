@@ -269,16 +269,33 @@ pub(in crate::runtime) async fn handle_server_path_with_authentication_slot(
     if let Some(metrics) = tcp_metrics.as_mut() {
         metrics.begin_epoch();
     }
-    let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
+    let prior = path_registration.initial_metrics();
+    let peer_timing = Arc::new(crate::runtime::path::peer_round_trip::PeerRoundTrip::new(
         context.mux_limits.tcp_path_heartbeat_interval,
         context.mux_limits.tcp_path_heartbeat_timeout,
-        tokio::time::Instant::now(),
-        heartbeat_initial_sample,
+        crate::model::timing::PeerTiming::prior(
+            prior.map_or_else(
+                crate::runtime::path::model::default_path_srtt_ms,
+                |metrics| f64::from(metrics.srtt_us) / 1000.0,
+            ),
+            prior.map_or(0.0, |metrics| f64::from(metrics.rttvar_us) / 1000.0),
+        ),
     ));
+    path_registration.bind_peer_timing(peer_timing.clone());
+    let heartbeat = Arc::new(
+        TcpCarrierHeartbeat::new(
+            context.mux_limits.tcp_path_heartbeat_interval,
+            context.mux_limits.tcp_path_heartbeat_timeout,
+            tokio::time::Instant::now(),
+            heartbeat_initial_sample,
+        )
+        .with_peer_timing(peer_timing.clone(), true),
+    );
 
     let (reader, writer) = framed.split()?;
     let (commands_tx, commands_rx) =
         reliable_path_command_channels(reliable_path_command_queue(context.mux_limits));
+    let commands_tx = commands_tx.with_peer_timing(peer_timing.reader());
     let observed_commands = commands_tx.clone();
     let observed_path_state = path_registration.state_handle();
     let observed_context = context.clone();

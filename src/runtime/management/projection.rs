@@ -876,6 +876,9 @@ fn client_path_status(
         authoritative_pacing_rate_bps,
     );
     ManagementPathStatus {
+        peer_round_trip: record
+            .last_peer_round_trip()
+            .map(|observation| management_peer_round_trip(observation, now)),
         native_delivery: record.native_delivery.map(Into::into),
         service: "mpp_outbound",
         service_index,
@@ -906,11 +909,11 @@ fn client_path_status(
         source: Some("local"),
         direction: Some("client_to_server"),
         usage_direction: snapshot.peer_usage.map(|_| "client_to_server"),
-        srtt_ms: Some(snapshot.srtt_ms),
-        jitter_ms: observation
-            .carrier_rttvar_ms
-            .or(observation.measured_jitter_ms)
-            .or_else(|| spec.metadata.initial_jitter_ms.map(f64::from)),
+        srtt_ms: Some(crate::runtime::path::model::path_model_srtt_ms(
+            spec,
+            observation,
+        )),
+        jitter_ms: client_rtt_variation(spec, observation),
         latency_source: Some(client_latency_source(spec, observation)),
         delivery_rate_bps: Some((display_rate_bps.round() as u64).to_string()),
         delivery_rate_observed: Some(approximate_rate.is_none() && rate.observed_at.is_some()),
@@ -997,6 +1000,7 @@ fn collect_server(
             .expect("server path names align with configured path inventory")
             .clone();
         paths.push(ManagementPathStatus {
+            peer_round_trip: None,
             native_delivery: None,
             service: "mpp_inbound",
             service_index,
@@ -1149,6 +1153,9 @@ fn collect_server(
             .expect("server session path refers to configured path inventory")
             .clone();
         paths.push(ManagementPathStatus {
+            peer_round_trip: path
+                .peer_round_trip
+                .map(|observation| management_peer_round_trip(observation, now)),
             native_delivery: path.native_delivery.map(Into::into),
             service: "mpp_inbound",
             service_index,
@@ -1564,14 +1571,26 @@ fn client_approximate_freshness_horizon_ms(observation: ClientPathObservation) -
 }
 
 fn client_latency_source(spec: &PathSpec, observation: ClientPathObservation) -> &'static str {
-    if observation.carrier_srtt_ms.is_some() || observation.carrier_rttvar_ms.is_some() {
+    if observation.carrier_srtt_ms.is_some() {
         "native_carrier"
-    } else if observation.measured_srtt_ms.is_some() || observation.measured_jitter_ms.is_some() {
+    } else if observation.measured_srtt_ms.is_some() {
         "mpp_feedback"
     } else if spec.metadata.initial_srtt_ms.is_some() || spec.metadata.initial_jitter_ms.is_some() {
         "configured_prior"
     } else {
         "scheduler_default"
+    }
+}
+
+fn client_rtt_variation(spec: &PathSpec, observation: ClientPathObservation) -> Option<f64> {
+    // A transport API may supply RTT without variation. Do not label a
+    // Product observation or configured prior as that transport's variation.
+    if observation.carrier_srtt_ms.is_some() {
+        observation.carrier_rttvar_ms
+    } else if observation.measured_srtt_ms.is_some() {
+        observation.measured_jitter_ms
+    } else {
+        spec.metadata.initial_jitter_ms.map(f64::from)
     }
 }
 
@@ -1658,6 +1677,21 @@ fn server_management_authoritative_rates(
     }
 }
 
+fn management_peer_round_trip(
+    observation: crate::runtime::path::peer_round_trip::PeerRoundTripObservation,
+    now: Instant,
+) -> super::schema::ManagementPeerRoundTrip {
+    super::schema::ManagementPeerRoundTrip {
+        rtt_ms: observation.elapsed.as_secs_f64() * 1_000.0,
+        sample_age_ms: u64::try_from(
+            now.saturating_duration_since(observation.observed_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX),
+        source: observation.source.name(),
+    }
+}
+
 #[cfg(test)]
 pub(super) fn client_metric_freshness_horizon_ms(observation: ClientPathObservation) -> u64 {
     let srtt_ms = observation
@@ -1733,6 +1767,8 @@ mod tests {
 
     fn local_sender_status(metrics: PathMetrics) -> ServerCarrierPathStatusSnapshot {
         ServerCarrierPathStatusSnapshot {
+            peer_timing: None,
+            peer_round_trip: None,
             native_delivery: None,
             session_id: SessionId(1),
             underlay: UnderlayProtocol::Udp,
@@ -1899,5 +1935,42 @@ mod tests {
             observed.finish().path_pacing_rate_bps.as_deref(),
             Some("123000000")
         );
+    }
+
+    #[test]
+    fn peer_round_trip_projection_retains_source_and_sample_age() {
+        use crate::runtime::path::peer_round_trip::{
+            PeerRoundTripObservation, PeerRoundTripSource,
+        };
+
+        let observed_at = Instant::now();
+        let observation = PeerRoundTripObservation {
+            elapsed: Duration::from_millis(160),
+            observed_at,
+            source: PeerRoundTripSource::Readiness,
+        };
+        let first = management_peer_round_trip(observation, observed_at + Duration::from_secs(5));
+        let later = management_peer_round_trip(observation, observed_at + Duration::from_secs(6));
+        assert_eq!(first.rtt_ms, 160.0);
+        assert_eq!(first.sample_age_ms, 5_000);
+        assert_eq!(first.source, "readiness_exchange");
+        assert_eq!(later.rtt_ms, first.rtt_ms);
+        assert_eq!(later.sample_age_ms, 6_000);
+    }
+
+    #[test]
+    fn missing_native_rtt_variation_does_not_borrow_product_timing() {
+        let spec = "tcp://127.0.0.1:1".parse::<PathSpec>().unwrap();
+        let mut observation = ClientPathObservation {
+            carrier_srtt_ms: Some(0.1),
+            measured_srtt_ms: Some(160.0),
+            measured_jitter_ms: Some(20.0),
+            ..ClientPathObservation::default()
+        };
+        assert_eq!(client_latency_source(&spec, observation), "native_carrier");
+        assert_eq!(client_rtt_variation(&spec, observation), None);
+        observation.carrier_srtt_ms = None;
+        assert_eq!(client_latency_source(&spec, observation), "mpp_feedback");
+        assert_eq!(client_rtt_variation(&spec, observation), Some(20.0));
     }
 }

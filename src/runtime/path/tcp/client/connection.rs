@@ -18,6 +18,7 @@ use crate::runtime::error::RuntimeError;
 use crate::runtime::identity::{random_u64, random_u64_sample};
 use crate::runtime::path::client_session::ClientSessionLifecycle;
 use crate::runtime::path::commands::reliable_path_writer_frame_queue;
+use crate::runtime::path::peer_round_trip::{PeerRoundTrip, PeerRoundTripSource};
 use crate::runtime::path::tcp::admission::ClientTcpPathAuthentication;
 use crate::transport::encrypted::{
     EncryptedFramedStream, EncryptedFramedTransportError, TcpClientTlsConfig,
@@ -41,6 +42,7 @@ pub(in crate::runtime) struct ClientTcpCarrierConnection {
     pub(in crate::runtime) peer_usage: PathUsage,
     /// One authenticated readiness exchange, excluding TCP connection setup.
     pub(in crate::runtime) readiness_rtt: Duration,
+    pub(super) peer_timing: Arc<PeerRoundTrip>,
     pub(in crate::runtime) local_addr: Option<std::net::SocketAddr>,
     pub(in crate::runtime) peer_addr: Option<std::net::SocketAddr>,
 }
@@ -230,7 +232,23 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
                 }
             }
         }
-        let readiness_rtt = readiness_started_at.elapsed();
+        let readiness_observed_at = Instant::now();
+        let readiness_rtt = readiness_observed_at.saturating_duration_since(readiness_started_at);
+        let peer_timing = Arc::new(PeerRoundTrip::new(
+            mux_limits.tcp_path_heartbeat_interval,
+            mux_limits.tcp_path_heartbeat_timeout,
+            crate::model::timing::PeerTiming::prior(
+                path.metadata
+                    .initial_srtt_ms
+                    .map_or_else(crate::runtime::path::model::default_path_srtt_ms, f64::from),
+                f64::from(path.metadata.initial_jitter_ms.unwrap_or(0)),
+            ),
+        ));
+        peer_timing.record(
+            readiness_rtt,
+            readiness_observed_at,
+            PeerRoundTripSource::Readiness,
+        );
 
         if let Some(metrics) = tcp_metrics.as_mut() {
             metrics.begin_epoch();
@@ -238,12 +256,15 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
 
         let (reader, writer) = framed.split()?;
         let now = tokio::time::Instant::now();
-        let heartbeat = Arc::new(TcpCarrierHeartbeat::new(
-            mux_limits.tcp_path_heartbeat_interval,
-            mux_limits.tcp_path_heartbeat_timeout,
-            now,
-            random_u64()?,
-        ));
+        let heartbeat = Arc::new(
+            TcpCarrierHeartbeat::new(
+                mux_limits.tcp_path_heartbeat_interval,
+                mux_limits.tcp_path_heartbeat_timeout,
+                now,
+                random_u64()?,
+            )
+            .with_peer_timing(peer_timing.clone(), false),
+        );
         let observed_lifecycle = session_lifecycle.clone();
         let observed_heartbeat = heartbeat.clone();
         let frames = spawn_encrypted_tcp_reader_with_filtered_observer(
@@ -302,6 +323,7 @@ pub(in crate::runtime) async fn connect_client_tcp_carrier(
             peer_usage_sequence: 0,
             peer_usage: peer_usage.expect("path usage checked before carrier creation"),
             readiness_rtt,
+            peer_timing,
             local_addr,
             peer_addr,
         })

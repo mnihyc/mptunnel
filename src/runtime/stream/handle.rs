@@ -1056,7 +1056,10 @@ impl FixedNativeRateEpoch {
         let rate_bps = snapshot
             .carrier_delivery_rate_bps
             .filter(|rate| rate.is_finite() && *rate > 0.0)?;
-        let horizon = fixed_rate_freshness_horizon(snapshot.srtt_ms, snapshot.jitter_ms);
+        let horizon = fixed_rate_freshness_horizon(
+            snapshot.transport_timing().srtt_ms(),
+            snapshot.transport_timing().rttvar_ms(),
+        );
         observed_at.checked_add(horizon).map(|expires_at| Self {
             rate_bps,
             observed_at,
@@ -1174,7 +1177,10 @@ impl FixedReliablePathOutput {
         let native_window_epoch = CarrierNativeWindowSample::new(
             startup.carrier_inflight_limit_bytes,
             observed_at,
-            fixed_rate_freshness_horizon(startup.srtt_ms, startup.jitter_ms),
+            fixed_rate_freshness_horizon(
+                startup.transport_timing().srtt_ms(),
+                startup.transport_timing().rttvar_ms(),
+            ),
         );
         let native_rate_epoch = FixedNativeRateEpoch::from_snapshot_at(startup, observed_at);
         Self::new_with_snapshot_and_path_instance(
@@ -1319,7 +1325,6 @@ impl FixedReliablePathOutput {
         let product_rate_epoch = model
             .product_rate_epoch
             .filter(|epoch| epoch.fresh_rate_at(now).is_some());
-        let raw_product_rate_bps = product_rate_epoch.map(|epoch| epoch.rate_bps);
         let (native_window_epoch, product_rate_bps, carrier_diagnostic_rate_bps, service_rate) =
             match rate_decision {
                 FixedRateDecision::Legacy => {
@@ -1372,20 +1377,29 @@ impl FixedReliablePathOutput {
             _ => (scalar_carrier_rate_bps, PathRateScope::PathCapacity),
         };
         let delivery_rate_bps = delivery_rate_bps.max(1.0);
-        let srtt_ms = match rate_decision {
-            FixedRateDecision::Native(shape) => {
-                if shape.srtt().is_zero() {
-                    self.portable_startup.srtt_ms
-                } else {
-                    shape.srtt().as_secs_f64() * 1000.0
-                }
-            }
-            FixedRateDecision::Legacy => raw_product_rate_bps
-                .and(model.srtt_ms)
-                .unwrap_or(self.portable_startup.srtt_ms),
-        };
         let mut snapshot = self.startup;
-        snapshot.srtt_ms = srtt_ms;
+        let transport = match rate_decision {
+            FixedRateDecision::Legacy => self.startup.transport_timing(),
+            FixedRateDecision::Native(shape) => {
+                crate::model::timing::TransportTiming::from_native_or_prior(
+                    shape.srtt(),
+                    shape.rttvar(),
+                    self.portable_startup.transport_timing(),
+                )
+            }
+        };
+        snapshot.set_timing(
+            if snapshot.underlay == crate::protocol::UnderlayProtocol::Tcp {
+                crate::model::timing::PathTiming::tcp(
+                    transport,
+                    self.commands
+                        .peer_timing_at(now)
+                        .unwrap_or(self.portable_startup.peer_timing()),
+                )
+            } else {
+                crate::model::timing::PathTiming::quic(transport)
+            },
+        );
         snapshot.delivery_rate_bps = delivery_rate_bps;
         snapshot.scheduling_service_rate = service_rate;
         snapshot.rate_scope = rate_scope;
@@ -1406,7 +1420,6 @@ impl FixedReliablePathOutput {
         snapshot.data_level_limit_bytes =
             reliable_product_feedback_window_bytes(Some(snapshot), lane, self.mux_limits) as u64;
         if let FixedRateDecision::Native(shape) = rate_decision {
-            snapshot.jitter_ms = shape.rttvar().as_secs_f64() * 1000.0;
             snapshot.pacing_rate_bps = shape
                 .pacing_rate_bps()
                 .map_or(delivery_rate_bps, |rate| rate.max(1) as f64);
@@ -1739,15 +1752,25 @@ impl FixedReliablePathOutput {
             let next_sample_bytes = fresh_prior_epoch.map_or(sample_bytes, |epoch| {
                 epoch.sample_bytes.saturating_add(sample_bytes)
             });
+            let freshness_horizon = if self.key.underlay == UnderlayProtocol::Tcp {
+                self.commands
+                    .peer_timing_at(now)
+                    .unwrap_or(self.portable_startup.peer_timing())
+                    .rate_freshness_horizon()
+            } else {
+                fixed_rate_freshness_horizon(
+                    model
+                        .srtt_ms
+                        .unwrap_or(self.startup.transport_timing().srtt_ms()),
+                    self.startup.transport_timing().rttvar_ms(),
+                )
+            };
             model.product_rate_epoch = FixedProductRateEpoch::new(
                 rate_bps,
                 next_delivery_samples,
                 next_sample_bytes,
                 now,
-                fixed_rate_freshness_horizon(
-                    model.srtt_ms.unwrap_or(self.startup.srtt_ms),
-                    self.startup.jitter_ms,
-                ),
+                freshness_horizon,
             );
             model.delivery_samples = model.delivery_samples.saturating_add(1);
         }
@@ -1845,7 +1868,10 @@ impl ReliablePathStreamOutput {
             CarrierNativeWindowSample::new(
                 startup.carrier_inflight_limit_bytes,
                 captured_at,
-                fixed_rate_freshness_horizon(startup.srtt_ms, startup.jitter_ms),
+                fixed_rate_freshness_horizon(
+                    startup.transport_timing().srtt_ms(),
+                    startup.transport_timing().rttvar_ms(),
+                ),
             )
         });
         let native_rate_epoch = startup_metrics.map_or_else(

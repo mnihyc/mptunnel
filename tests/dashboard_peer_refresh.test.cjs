@@ -130,7 +130,7 @@ function harness() {
     rate() {
       const row = h.rows()[0];
       if (!row) return null;
-      return row.children.find((cell) => cell.dataset.label === "Rate").children[0].children[0].textContent;
+      return row.children.find((cell) => cell.dataset.label === "Transport rate").children[0].children[0].textContent;
     },
     peer(owner = session) { return app.state.peerDiagnostics && app.state.peerDiagnostics.get(app.peerSessionKey(owner)); },
     snapshot(owner = session) { return h.peer(owner).snapshot; }

@@ -934,13 +934,14 @@
     cell.append(createElement("span", "cell-secondary", "P " + formatDiagnosticMetric(
       path.pacing_rate_bps, formatBitRate, pacingStale, path.pacing_rate_approximate === true)));
     cell.title = [
-      "Delivery / E: retained estimate / P: pacing",
+      "Transport ACK rate / E: retained estimate / P: pacing",
       "Delivery direction: " + directionLabel(quality.direction),
       "Estimate direction: " + directionLabel(path.direction),
       "Estimate source: " + (path.delivery_rate_source ? titleCase(path.delivery_rate_source) : "-"),
       "Estimate scope: " + (path.delivery_rate_scope ? titleCase(path.delivery_rate_scope) : "-"),
       "ACK interval: " + formatOptionalMetric(quality.elapsedMs, formatDuration, false),
       "Native ACK bytes include carrier framing, not unique application payload",
+      "TCP ACKs may end at an intermediate proxy, not the remote MPP peer",
       "An estimate or pacing setting is not measured current throughput"
     ].join("\n");
     return cell;
@@ -967,7 +968,9 @@
     const serialization = formatQualitySerialization(quality);
     cell.append(createElement("span", "cell-secondary", serialization === "-" ? "-" : "64K / " + serialization));
     cell.title = [
-      "Share among fresh observed paths / bytes and interval / 64 KiB serialization",
+      "Transport ACK-rate share / bytes and interval / 64 KiB serialization",
+      "Share among fresh observed paths, measured as transport ACK rate",
+      "Not path capacity, scheduler allocation, application share, or end-to-end completion time",
       "Fresh rate coverage: " + formatCount(quality.coverageFresh) + "/" + formatCount(quality.coverageTotal) + " paths",
       "Counter direction: " + directionLabel(quality.direction),
       "Fresh rates normalize over the fresh subset; stale or missing observations are excluded, not treated as zero",
@@ -993,12 +996,54 @@
       meaning = "Transport loss ratio; units and interval depend on the carrier and source";
     }
     return [
-      meaning + "; not a physical packet-loss probability",
+      meaning + "; not a physical packet-loss probability or end-to-end MPP failure rate",
       "Loss: " + (path.loss_source ? titleCase(path.loss_source) : "-") +
         " (" + (lossStale ? "stale" : "current") + "); ECN: " +
         (path.ecn_source ? titleCase(path.ecn_source) : "-") +
         " (" + (ecnStale ? "stale" : "current") + ")"
     ].join("\n");
+  }
+
+  // Only an explicitly scoped peer exchange may populate the operator RTT.
+  // In particular, legacy srtt/native/peer-advisory values are not fallbacks.
+  function peerRoundTripEvidence(path, residenceMs) {
+    const sample = asObject(path.peer_round_trip);
+    const value = sample.rtt_ms;
+    const age = sample.sample_age_ms;
+    const supportedSource = sample.source === "readiness_exchange" || sample.source === "path_proof" || sample.source === "heartbeat";
+    if (!supportedSource || typeof value !== "number" || !Number.isFinite(value) || value <= 0 ||
+        typeof age !== "number" || !Number.isFinite(age) || age < 0) return null;
+    return { rttMs: value, ageMs: age + Math.max(0, finiteNumber(residenceMs)), source: sample.source };
+  }
+
+  function pathRoundTripCell(path, snapshotStale, residenceMs, remote) {
+    const cell = createElement("div");
+    // Legacy peer protocol reports do not carry this scoped observation.
+    const sample = remote ? null : peerRoundTripEvidence(path, residenceMs);
+    cell.append(createElement("span", "cell-primary", sample
+      ? formatOptionalMetric(sample.rttMs, formatRtt, snapshotStale) : "--"));
+    cell.append(createElement("span", "cell-secondary", sample
+      ? "Last " + formatDuration(sample.ageMs) + " ago" : "Peer RTT unobserved"));
+    const legacyRtt = remote ? (metricAvailable(path.srtt_us) ? finiteNumber(path.srtt_us) / 1000 : null) : path.srtt_ms;
+    const legacySource = String(path.latency_source || "unknown");
+    const label = remote ? "Reported RTT" : legacySource === "native_carrier"
+      ? "Transport RTT" : legacySource === "configured_prior" || legacySource === "scheduler_default"
+        ? "Prior RTT" : "Model RTT";
+    cell.append(createElement("span", "cell-secondary", label + " " +
+      formatOptionalMetric(legacyRtt, formatRtt, snapshotStale)));
+    cell.title = [
+      "Last locally timed authenticated MPP exchange on this exact carrier",
+      "Includes protocol processing and queues; not one-way delay or application target latency",
+      "Peer RTT source: " + (sample ? titleCase(sample.source) : "unavailable"),
+      "Age is independent of native traffic counters; last does not mean current",
+      "Reported/model source: " + titleCase(legacySource),
+      (legacySource === "native_carrier" ? "Transport" : "Reported/model") + " RTT variation: " +
+        formatOptionalMetric(remote ? (metricAvailable(path.rttvar_us) ? finiteNumber(path.rttvar_us) / 1000 : null) : path.jitter_ms, formatRtt, snapshotStale),
+      "TCP transport RTT reaches the TCP peer, which may be an intermediate stream proxy",
+      "Legacy RTT variation is not packet jitter; native/model timing is not a peer RTT fallback",
+      "Snapshot: " + (snapshotStale ? "stale" : "current")
+    ].join("\n");
+    return cell;
   }
 
   function localPathSortValue(column, entry) {
@@ -1021,8 +1066,10 @@
           asObject(path.policy).expensive,
           asObject(path.policy).control_only
         ];
-      case "latency":
-        return [path.srtt_ms, path.jitter_ms];
+      case "latency": {
+        const sample = peerRoundTripEvidence(path, 0);
+        return sample ? [sample.rttMs, sample.ageMs] : null;
+      }
       case "rate":
         return [quality.rate, path.delivery_rate_bps, path.pacing_rate_bps];
       case "loss":
@@ -1063,7 +1110,7 @@
       case "use":
         return [path.usage, path.usage_direction];
       case "latency":
-        return [path.srtt_us, path.rttvar_us, path.jitter_us];
+        return null; // This peer protocol version has no scoped peer-RTT observation.
       case "rate":
         return [quality.rate, path.delivery_rate_bps, path.pacing_rate_bps];
       case "loss":
@@ -2160,17 +2207,11 @@
     ].join("\n");
     appendCell(row, "Use", usage);
 
-    const rtt = createElement("div");
-    rtt.append(createElement("span", "cell-primary", formatOptionalMetric(path.srtt_ms, formatRtt, snapshotStale)));
-    rtt.append(createElement("span", "cell-secondary", formatOptionalMetric(path.jitter_ms, formatObservedLatency, snapshotStale)));
-    rtt.title = [
-      "RTT / jitter",
-      "Source: " + (path.latency_source ? titleCase(path.latency_source) : "-"),
-      "Evidence: " + (snapshotStale ? "stale" : "current")
-    ].join("\n");
-    appendCell(row, "Latency", rtt);
+    appendCell(row, "Last peer RTT", pathRoundTripCell(
+      path, snapshotStale, statusResidenceMs(), false
+    ));
 
-    appendCell(row, "Rate", nativeRateCell(path, qualityValueObject, rateStale, pacingStale));
+    appendCell(row, "Transport rate", nativeRateCell(path, qualityValueObject, rateStale, pacingStale));
 
     const loss = createElement("div");
     loss.append(createElement("span", "cell-primary", formatDiagnosticMetric(
@@ -2178,9 +2219,9 @@
     )));
     loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, ecnStale)));
     loss.title = lossCellTitle(path, lossStale, ecnStale);
-    appendCell(row, "Loss", loss);
+    appendCell(row, "Transport loss", loss);
 
-    appendCell(row, "Quality", nativeQualityCell(path, qualityValueObject));
+    appendCell(row, "ACK share", nativeQualityCell(path, qualityValueObject));
 
     const flight = createElement("div");
     flight.append(createElement("span", "cell-primary", formatOptionalMetric(path.queue_bytes, formatBytes, snapshotStale)));
@@ -2191,7 +2232,7 @@
         " / " + formatOptionalMetric(path.data_level_bytes_in_flight, formatBytes, snapshotStale)
     ));
     flight.append(createElement("span", "cell-secondary", formatOptionalMetric(path.inflight_limit_bytes, formatBytes, snapshotStale)));
-    flight.title = "Queue / native carrier flight / MPP data flight / native limit";
+    flight.title = "Local queue / native transport flight / MPP unacknowledged data / native limit. Native TCP flight excludes bytes already ACKed into an intermediate proxy; this is not proxy queue occupancy.";
     appendCell(row, "Flight", flight);
 
     const evidence = createElement("div");
@@ -2522,22 +2563,11 @@
     useDirection.title = "Usage direction: " + directionLabel(path.usage_direction);
     appendCell(row, "Use", useDirection);
 
-    const rtt = createElement("div");
-    rtt.append(createElement("span", "cell-primary", formatOptionalMetric(path.srtt_us, formatRttMicros, snapshotStale)));
-    rtt.append(createElement(
-      "span",
-      "cell-secondary",
-      formatOptionalMetric(path.rttvar_us, formatObservedLatencyMicros, snapshotStale) +
-        " / " + formatOptionalMetric(path.jitter_us, formatObservedLatencyMicros, snapshotStale)
+    appendCell(row, "Last peer RTT", pathRoundTripCell(
+      path, snapshotStale, peerResultResidenceMs(result), true
     ));
-    rtt.title = [
-      "RTT / RTT variation / jitter",
-      "Source: " + (path.latency_source ? titleCase(path.latency_source) : "-"),
-      "Evidence: " + (snapshotStale ? "stale" : "current")
-    ].join("\n");
-    appendCell(row, "Latency", rtt);
 
-    appendCell(row, "Rate", nativeRateCell(path, qualityValueObject, rateStale, rateStale));
+    appendCell(row, "Transport rate", nativeRateCell(path, qualityValueObject, rateStale, rateStale));
 
     const loss = createElement("div");
     loss.append(createElement("span", "cell-primary", formatDiagnosticMetric(
@@ -2545,9 +2575,9 @@
     )));
     loss.append(createElement("span", "cell-secondary", formatOptionalMetric(path.ecn_ppm, formatPpm, ecnStale)));
     loss.title = lossCellTitle(path, lossStale, ecnStale);
-    appendCell(row, "Loss", loss);
+    appendCell(row, "Transport loss", loss);
 
-    appendCell(row, "Quality", nativeQualityCell(path, qualityValueObject));
+    appendCell(row, "ACK share", nativeQualityCell(path, qualityValueObject));
 
     const flight = createElement("div");
     flight.append(createElement("span", "cell-primary", formatOptionalMetric(path.queue_bytes, formatBytes, snapshotStale)));

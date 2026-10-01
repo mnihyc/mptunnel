@@ -735,7 +735,8 @@ fn native_fixed_output_reads_every_same_activation_rate_and_product_cannot_overr
     assert_eq!(initial.bytes_in_flight, 256 * 1024);
     assert_eq!(initial.pacing_rate_bps, 100_000_000.0);
     assert_eq!(
-        initial.srtt_ms, 80.0,
+        initial.transport_timing().srtt_ms(),
+        80.0,
         "native timing must come from the matching activation, not Product timing"
     );
 
@@ -938,7 +939,10 @@ fn fixed_output_request_feedback_snapshot_preserves_send_path_timing() {
 
     assert_eq!(request_feedback_snapshot.id, send_snapshot.id);
     assert_eq!(request_feedback_snapshot.underlay, send_snapshot.underlay);
-    assert_eq!(request_feedback_snapshot.srtt_ms, send_snapshot.srtt_ms);
+    assert_eq!(
+        request_feedback_snapshot.transport_timing().srtt_ms(),
+        send_snapshot.transport_timing().srtt_ms()
+    );
     assert_eq!(
         reliable_stream_recv_progress_interval(Some(request_feedback_snapshot)),
         reliable_stream_recv_progress_interval(Some(send_snapshot)),
@@ -1860,5 +1864,73 @@ async fn ready_server_input_never_crosses_a_path_detach_lifecycle_boundary() {
             .await
             .expect("ordinary receive processes detach before later data"),
         second_data
+    );
+}
+
+#[test]
+fn fixed_tcp_response_uses_exact_peer_exchange_for_recovery() {
+    use crate::model::timing::{PeerTiming, reliable_data_ack_loss_delay};
+    use crate::runtime::path::peer_round_trip::{PeerRoundTrip, PeerRoundTripSource};
+    let now = Instant::now();
+    let timing = Arc::new(PeerRoundTrip::new(
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+        PeerTiming::new(333.0, 0.0),
+    ));
+    let (commands, _receivers) = reliable_path_command_channels(8);
+    let startup = PathSnapshot::new(PathId(8), UnderlayProtocol::Tcp, 0.1, 100_000_000.0);
+    let output = ReliablePathStreamOutput::fixed_with_snapshot(
+        startup,
+        commands.with_peer_timing(timing.reader()),
+        MuxLimits::default(),
+    );
+    let ReliablePathStreamOutput::Fixed(fixed) = output else {
+        panic!("fixed output");
+    };
+    timing.record(
+        Duration::from_millis(160),
+        now,
+        PeerRoundTripSource::Heartbeat,
+    );
+    let snapshot = fixed.send_path_snapshot_at(TrafficClass::Throughput, now);
+    assert_eq!(snapshot.transport_timing().srtt_ms(), 0.1);
+    assert_eq!(
+        reliable_data_ack_loss_delay(Some(UnderlayProtocol::Tcp), Some(snapshot)),
+        Some(Duration::from_millis(200))
+    );
+    fixed.record_original_flight(&stream_data_frame_at(0, MIN_RATE_SAMPLE_BYTES as usize));
+    let acked_at = Instant::now() + Duration::from_millis(20);
+    fixed.release_normalized_acked_ranges_at(
+        &[OffsetRange {
+            start: 0,
+            end: MIN_RATE_SAMPLE_BYTES,
+        }],
+        acked_at,
+    );
+    let expires_at = fixed
+        .model
+        .lock()
+        .unwrap()
+        .product_rate_epoch
+        .unwrap()
+        .expires_at;
+    assert_eq!(
+        expires_at,
+        acked_at + snapshot.peer_timing().rate_freshness_horizon()
+    );
+    timing.record(
+        Duration::from_millis(1),
+        acked_at,
+        PeerRoundTripSource::Heartbeat,
+    );
+    assert_eq!(
+        fixed
+            .model
+            .lock()
+            .unwrap()
+            .product_rate_epoch
+            .unwrap()
+            .expires_at,
+        expires_at
     );
 }

@@ -2339,7 +2339,6 @@ where
         initial_recv_max_offset as usize,
     );
     let mut target_apply_error = None;
-    let mut target_receipt_pending = false;
     let mut target_progress_offset = 0;
     let mut target_shutdown_requested = false;
     let mut buf = bytes::BytesMut::with_capacity(chunk_size);
@@ -2490,12 +2489,10 @@ where
             break Err(error);
         }
         let target_progress = target_delivery.delivered_offset() != target_progress_offset;
-        if target_receipt_pending || target_progress {
-            // A genuinely Pending write/flush offers admitted receipt without
-            // waiting for target consumption. Successful flush alone advances
-            // MAX; a partially completed write is durable but grants no credit.
-            let force_ack = target_poll.is_pending()
-                || pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset);
+        if target_progress {
+            // Receipt was offered after the bounded receive batch. Successful
+            // target flush alone advances MAX; it does not clock receipt ACKs.
+            let force_ack = pending_stream_fin_ready(&recv_stream, pending_remote_fin_offset);
             if enqueue_tcp_recv_progress(
                 path_stream,
                 &mut recv_stream,
@@ -2512,7 +2509,6 @@ where
                 response_sender_retry_at = None;
                 last_recv_progress_sent_at = Instant::now();
             }
-            target_receipt_pending = !target_poll.is_pending() && target_delivery.has_work();
             target_progress_offset = target_delivery.delivered_offset();
         }
         if target_delivery.is_shutdown() {
@@ -3405,27 +3401,9 @@ where
             }
             continue;
         }
-        result = poll_fn(|cx| match target_delivery.poll_io(cx, &mut local_write) {
-            Poll::Pending if target_receipt_pending => Poll::Ready(None),
-            result => result.map(Some),
-        }),
+        result = poll_fn(|cx| target_delivery.poll_io(cx, &mut local_write)),
             if target_delivery.has_work() => {
-            if let Some(result) = result {
-                result?;
-            } else {
-                // The fast poll may have accepted only a prefix. Surface the
-                // first real Pending here once, before the actor can park.
-                if enqueue_tcp_recv_progress(
-                    path_stream, &mut recv_stream, &mut recv_progress,
-                    &mut request_ack_publication, request_feedback_path_snapshot,
-                    request_lane, mux_limits, true, false, false,
-                    target_delivery.delivered_offset(),
-                ) {
-                    response_sender_retry_at = None;
-                    last_recv_progress_sent_at = Instant::now();
-                }
-                target_receipt_pending = false;
-            }
+            result?;
             continue;
         }
         // Server input interleaves Product frames with ordered attachment
@@ -3549,7 +3527,19 @@ where
                     );
                     target_apply_error = applied.into_apply_error();
                     target_delivery.append_batch(ready_path_data.take_delivery())?;
-                    target_receipt_pending = true;
+                    // Publish receipt once per bounded input batch, before
+                    // target I/O. A ready sink must not withhold a subthreshold
+                    // ACK until half a peer PTO while a blocked sink sends it
+                    // immediately. MAX_DATA still follows successful flush.
+                    if enqueue_tcp_recv_progress(
+                        path_stream, &mut recv_stream, &mut recv_progress,
+                        &mut request_ack_publication, request_feedback_path_snapshot,
+                        request_lane, mux_limits, true, false, false,
+                        target_delivery.delivered_offset(),
+                    ) {
+                        response_sender_retry_at = None;
+                        last_recv_progress_sent_at = Instant::now();
+                    }
                 }
                 Frame::StreamAck {
                     stream_id: ack_stream_id,
@@ -3782,7 +3772,6 @@ where
                         remote_open,
                         final_offset,
                     )?;
-                    target_receipt_pending = true;
                 }
                 Frame::StreamReset {
                     stream_id: reset_stream_id,

@@ -578,7 +578,7 @@ fn normal_request_bulk_can_feed_current_underfed_quic_credit() {
     let underfed = instance(UnderlayProtocol::Udp, 1, 74);
     let mut owner_path = observed_path(owner, 100.0, 500_000_000.0);
     let owner_snapshot = owner_path.shared_snapshot.as_mut().expect("owner snapshot");
-    owner_snapshot.jitter_ms = 3.0;
+    owner_snapshot.set_rttvar_for_test(3.0);
     owner_snapshot.bytes_in_flight = PAYLOAD_BYTES as u64;
     owner_snapshot.data_level_bytes_in_flight = PAYLOAD_BYTES as u64;
     let mut underfed_path = observed_path(underfed, 101.0, 500_000_000.0);
@@ -586,7 +586,7 @@ fn normal_request_bulk_can_feed_current_underfed_quic_credit() {
         .shared_snapshot
         .as_mut()
         .expect("underfed snapshot");
-    underfed_snapshot.jitter_ms = 3.0;
+    underfed_snapshot.set_rttvar_for_test(3.0);
     underfed_snapshot.app_limited = true;
     let observation = scheduling_observation([owner_path, underfed_path]);
     let flights = original_flights(owner);
@@ -605,7 +605,7 @@ fn tcp_delivery_sample_app_limited_flag_does_not_preempt_request_owner() {
     let sampled_tcp = instance(UnderlayProtocol::Tcp, 1, 78);
     let mut owner_path = observed_path(owner, 100.0, 500_000_000.0);
     let owner_snapshot = owner_path.shared_snapshot.as_mut().expect("owner snapshot");
-    owner_snapshot.jitter_ms = 3.0;
+    owner_snapshot.set_rttvar_for_test(3.0);
     owner_snapshot.bytes_in_flight = PAYLOAD_BYTES as u64;
     owner_snapshot.data_level_bytes_in_flight = PAYLOAD_BYTES as u64;
     let mut sampled_path = observed_path(sampled_tcp, 101.0, 500_000_000.0);
@@ -613,7 +613,7 @@ fn tcp_delivery_sample_app_limited_flag_does_not_preempt_request_owner() {
         .shared_snapshot
         .as_mut()
         .expect("sampled TCP snapshot");
-    sampled_snapshot.jitter_ms = 3.0;
+    sampled_snapshot.set_rttvar_for_test(3.0);
     sampled_snapshot.app_limited = true;
     let observation = scheduling_observation([owner_path, sampled_path]);
     let flights = original_flights(owner);
@@ -637,7 +637,7 @@ fn materially_slower_underfed_request_credit_cannot_preempt_the_live_frontier() 
         let underfed = instance(underlay, 1, 76);
         let mut owner_path = observed_path(owner, 80.0, 555_000_000.0);
         let owner_snapshot = owner_path.shared_snapshot.as_mut().expect("owner snapshot");
-        owner_snapshot.jitter_ms = 20.0;
+        owner_snapshot.set_rttvar_for_test(20.0);
         owner_snapshot.bytes_in_flight = PAYLOAD_BYTES as u64;
         owner_snapshot.data_level_bytes_in_flight = PAYLOAD_BYTES as u64;
 
@@ -647,7 +647,7 @@ fn materially_slower_underfed_request_credit_cannot_preempt_the_live_frontier() 
             .shared_snapshot
             .as_mut()
             .expect("underfed snapshot");
-        underfed_snapshot.jitter_ms = 20.0;
+        underfed_snapshot.set_rttvar_for_test(20.0);
         underfed_snapshot.app_limited = true;
         let owner_eta =
             scheduler::score_path(*owner_snapshot, TrafficClass::Throughput, PAYLOAD_BYTES)
@@ -658,7 +658,7 @@ fn materially_slower_underfed_request_credit_cannot_preempt_the_live_frontier() 
                 .expect("underfed score")
                 .eta_ms;
         assert!(
-            underfed_eta > owner_eta + owner_snapshot.jitter_ms,
+            underfed_eta > owner_eta + owner_snapshot.transport_timing().rttvar_ms(),
             "the fixture must reproduce a materially later underfed carrier: owner={owner_eta:.3} ms underfed={underfed_eta:.3} ms",
         );
 
@@ -787,7 +787,7 @@ fn exact_lower_flight_owner_continues_within_measured_hysteresis() {
     let owner = instance(UnderlayProtocol::Udp, 1, 31);
     let mut owner_path = observed_path(owner, 10.0, 500_000_000.0);
     let owner_snapshot = owner_path.shared_snapshot.as_mut().expect("snapshot");
-    owner_snapshot.jitter_ms = 2.0;
+    owner_snapshot.set_rttvar_for_test(2.0);
     owner_snapshot.data_level_limit_bytes = PAYLOAD_BYTES as u64;
     owner_snapshot.data_level_bytes_in_flight = (2 * PAYLOAD_BYTES) as u64;
     let mut challenger_path = observed_path(challenger, 8.0, 500_000_000.0);
@@ -795,7 +795,7 @@ fn exact_lower_flight_owner_continues_within_measured_hysteresis() {
         .shared_snapshot
         .as_mut()
         .expect("snapshot")
-        .jitter_ms = 2.0;
+        .set_rttvar_for_test(2.0);
     let observation = scheduling_observation([challenger_path, owner_path]);
     let flights = original_flights(owner);
     let evidence = RequestEvidence::default().prove_rate([owner, challenger]);
@@ -987,7 +987,7 @@ fn fresh_native_tcp_capacity_outweighs_mature_product_fallback() {
     let alternative = PathSnapshot::new(
         PathId(1),
         UnderlayProtocol::Tcp,
-        projected.srtt_ms,
+        projected.transport_timing().srtt_ms(),
         40_000_000.0,
     );
     assert_eq!(

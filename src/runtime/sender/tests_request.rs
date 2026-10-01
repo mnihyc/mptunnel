@@ -1482,7 +1482,7 @@ async fn client_ack_gap_model_separates_owner_transport_from_reinjection_output(
     let unproven_reinjection_path = observation.reinjection_target;
     assert_eq!(original_underlay, Some(UnderlayProtocol::Tcp));
     assert_eq!(
-        original_path_timing.map(|snapshot| snapshot.srtt_ms),
+        original_path_timing.map(|snapshot| snapshot.transport_timing().srtt_ms()),
         Some(500.0),
         "persistent-gap proof time follows the original TCP path"
     );
@@ -3575,6 +3575,8 @@ async fn committed_request_copy_deadline_is_not_recomputed_from_later_path_timin
             sent_at: Instant::now(),
         },
     );
+    context.health().lock().expect("health lock").tcp[owner.key.index]
+        .set_peer_timing_for_test(5_000.0, 625.0);
     let later_owner_interval = crate::model::timing::reliable_data_retransmission_interval(
         Some(owner.key.underlay),
         context.reliable_path_snapshot_for_instance(owner),
@@ -3606,6 +3608,13 @@ async fn committed_request_copy_deadline_is_not_recomputed_from_later_path_timin
             sent_at: Instant::now(),
         },
     );
+    {
+        // QUIC's authenticated endpoint is its native endpoint. Change that
+        // observation; a generic PATH_PROOF duration cannot mutate its tuple.
+        let mut health = context.health().lock().expect("health lock");
+        health.udp[copy.key.index].carrier_srtt_ms = Some(5_000.0);
+        health.udp[copy.key.index].carrier_rttvar_ms = Some(625.0);
+    }
     let later_dynamic_interval = crate::model::timing::reliable_data_retransmission_interval(
         Some(copy.key.underlay),
         context.reliable_path_snapshot_for_instance(copy),

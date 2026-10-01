@@ -527,14 +527,32 @@ fn dashboard_auto_refresh_contract_is_bounded_and_includes_peer_status() {
         (
             local_row,
             &[
-                "State", "Path", "Service", "Carrier", "Use", "Latency", "Rate", "Loss", "Quality",
-                "Flight", "Evidence", "Flows",
+                "State",
+                "Path",
+                "Service",
+                "Carrier",
+                "Use",
+                "Last peer RTT",
+                "Transport rate",
+                "Transport loss",
+                "ACK share",
+                "Flight",
+                "Evidence",
+                "Flows",
             ][..],
         ),
         (
             peer_row,
             &[
-                "State", "Path", "Carrier", "Use", "Latency", "Rate", "Loss", "Quality", "Flight",
+                "State",
+                "Path",
+                "Carrier",
+                "Use",
+                "Last peer RTT",
+                "Transport rate",
+                "Transport loss",
+                "ACK share",
+                "Flight",
                 "Evidence",
             ][..],
         ),
@@ -653,7 +671,6 @@ fn dashboard_path_sorting_is_numeric_stable_and_table_local() {
         .0;
     for accessor in [local_accessor, peer_accessor] {
         for raw_metric in [
-            "srtt_",
             "delivery_rate_bps",
             "loss_ppm",
             "sharePpm",

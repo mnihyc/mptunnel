@@ -256,8 +256,20 @@ impl From<crate::protocol::NativeDeliverySnapshot> for ManagementNativeDelivery 
     }
 }
 
+/// An observation, not a claim of current propagation delay or remote target RTT.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ManagementPeerRoundTrip {
+    pub(super) rtt_ms: f64,
+    /// Age since the locally observed, correlated exchange completion.
+    pub(super) sample_age_ms: u64,
+    pub(super) source: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ManagementPathStatus {
+    /// Last locally timed authenticated MPP exchange; never a native fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) peer_round_trip: Option<ManagementPeerRoundTrip>,
     pub(super) native_delivery: Option<ManagementNativeDelivery>,
     pub(super) service: &'static str,
     pub(super) service_index: usize,

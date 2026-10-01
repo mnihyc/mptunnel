@@ -994,7 +994,7 @@ fn evaluate_server_carrier(
     ) else {
         return ServerIpCarrierEvaluation::Unavailable;
     };
-    let flowlet_timeout = crate::model::timing::transport_pto_from_snapshot(Some(snapshot));
+    let flowlet_timeout = crate::model::timing::peer_pto_from_snapshot(Some(snapshot));
     ServerIpCarrierEvaluation::Candidate(RankedServerIpDispatchPlan {
         current_mismatch: basis.current != Some(attachment.key),
         backup: crate::scheduler::path_is_backup(snapshot),
@@ -1062,7 +1062,7 @@ fn apply_server_ip_dispatch(
                                 .congestion_window()
                                 .max(u64::from(shape.current_mtu())),
                         ),
-                        crate::model::timing::transport_pto_from_snapshot(Some(snapshot)),
+                        crate::model::timing::peer_pto_from_snapshot(Some(snapshot)),
                     )
                 }
                 None if current_authority_shape.is_none() => (None, plan.flowlet_timeout),
@@ -1226,7 +1226,13 @@ fn server_native_packet_snapshot(
         crate::scheduler::PathState::Failed
     };
     if valid {
-        snapshot.jitter_ms = shape.rttvar().as_secs_f64() * 1_000.0;
+        snapshot.set_timing(crate::model::timing::PathTiming::quic(
+            crate::model::timing::TransportTiming::from_native_or_prior(
+                shape.srtt(),
+                shape.rttvar(),
+                snapshot.transport_timing(),
+            ),
+        ));
         snapshot.pacing_rate_bps = shape
             .pacing_rate_bps()
             .or(finite_rate_bps)
@@ -1319,6 +1325,18 @@ fn server_tcp_packet_snapshot_at(
         srtt_ms,
         legacy_rate.delivery_rate_bps,
     );
+    snapshot.set_timing(crate::model::timing::PathTiming::tcp(
+        snapshot.transport_timing(),
+        status.and_then(|status| status.peer_timing).unwrap_or(
+            crate::model::timing::PeerTiming::prior(
+                startup_metrics.map_or_else(
+                    crate::runtime::path::model::default_path_srtt_ms,
+                    |metrics| f64::from(metrics.srtt_us) / 1_000.0,
+                ),
+                startup_metrics.map_or(0.0, |metrics| f64::from(metrics.rttvar_us) / 1_000.0),
+            ),
+        ),
+    ));
     if let Some(service_rate) = service_rate {
         snapshot = snapshot.with_scheduling_service_rate(service_rate);
     }
@@ -1341,7 +1359,13 @@ fn server_tcp_packet_snapshot_at(
         }
     };
     if let Some(metrics) = metrics {
-        snapshot.jitter_ms = f64::from(metrics.jitter_us) / 1_000.0;
+        snapshot.set_timing(crate::model::timing::PathTiming::tcp(
+            crate::model::timing::TransportTiming::new(
+                snapshot.transport_timing().srtt_ms(),
+                f64::from(metrics.rttvar_us) / 1_000.0,
+            ),
+            snapshot.peer_timing(),
+        ));
         snapshot.loss_rate = if metrics.loss_observed {
             f64::from(metrics.loss_ppm) / 1_000_000.0
         } else {
@@ -1879,6 +1903,8 @@ mod packet_metric_authority_tests {
         carrier_delivery_rate_sample: Option<CarrierDeliveryRateSample>,
     ) -> ServerCarrierPathStatusSnapshot {
         ServerCarrierPathStatusSnapshot {
+            peer_round_trip: None,
+            peer_timing: None,
             native_delivery: None,
             session_id: SessionId(11),
             underlay,
@@ -1985,8 +2011,8 @@ mod packet_metric_authority_tests {
         assert_eq!(snapshot.delivery_rate_bps, 83_000_000.0);
         assert_eq!(snapshot.carrier_delivery_rate_bps, Some(83_000_000.0));
         assert_eq!(snapshot.pacing_rate_bps, 97_000_000.0);
-        assert_eq!(snapshot.srtt_ms, 37.0);
-        assert_eq!(snapshot.jitter_ms, 6.0);
+        assert_eq!(snapshot.transport_timing().srtt_ms(), 37.0);
+        assert_eq!(snapshot.transport_timing().rttvar_ms(), 6.0);
         assert_eq!(snapshot.bytes_in_flight, 12_000);
         assert_eq!(snapshot.carrier_inflight_limit_bytes, 333_000);
         assert_eq!(snapshot.loss_rate, 0.0);
@@ -2000,10 +2026,17 @@ mod packet_metric_authority_tests {
     #[test]
     fn tcp_packet_projection_has_exact_scoped_startup_rate() {
         let (startup, live) = packet_metrics(UnderlayProtocol::Tcp);
-        let status = status(UnderlayProtocol::Tcp, live, None);
+        let mut status = status(UnderlayProtocol::Tcp, live, None);
+        status.peer_timing = Some(crate::model::timing::PeerTiming::new(160.0, 20.0));
         let (attachment, _lifetime) = attachment(UnderlayProtocol::Tcp, startup);
 
         let snapshot = server_tcp_packet_snapshot_at(Some(&status), &attachment, Instant::now());
+        assert_eq!(
+            snapshot.transport_timing().srtt_ms(),
+            f64::from(live.srtt_us) / 1_000.0
+        );
+        assert_eq!(snapshot.peer_timing().srtt_ms(), 160.0);
+        assert_eq!(snapshot.peer_timing().rttvar_ms(), 20.0);
         let service_rate = snapshot
             .scheduling_service_rate()
             .expect("exact TCP packet action must carry its immutable startup service rate");
@@ -2098,8 +2131,7 @@ mod packet_metric_authority_tests {
         assert_ne!(current_shape, initial_shape);
         let current_snapshot =
             server_native_packet_snapshot(&plan.status, &plan.attachment, current_shape);
-        let current_timeout =
-            crate::model::timing::transport_pto_from_snapshot(Some(current_snapshot));
+        let current_timeout = crate::model::timing::peer_pto_from_snapshot(Some(current_snapshot));
         assert!(current_timeout > planning_timeout);
 
         let carrier_key = plan.attachment.key;

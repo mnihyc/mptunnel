@@ -718,6 +718,12 @@ fn ordinary_ecf_keeps_the_selected_unqualified_output_while_it_remains_best() {
     fixture
         .binding
         .set_output_product_model_for_test(fixture.first_additional, 500_000_000.0, 1.0);
+    fixture
+        .binding
+        .set_output_peer_timing_for_test(fixture.owner, 500.0, 62.5);
+    fixture
+        .binding
+        .set_output_peer_timing_for_test(fixture.first_additional, 1.0, 0.125);
     mark_response_output_backup(&fixture.binding, fixture.second_additional);
     let mut sender = ServerResponseSenderService::new(SessionId(31), StreamId(31));
     let mut send_stream = ReliableSendStream::new(StreamId(31), fixture.limits);

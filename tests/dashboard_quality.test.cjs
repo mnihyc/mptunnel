@@ -404,3 +404,88 @@ test("approximate fallback marks the derived serialization estimate", () => {
     etaMs: null, stale: false, approximate: true
   }), "-");
 });
+
+// These execute the production peer-evidence and rendering helpers. Native
+// counters and scheduler defaults must never fabricate a peer observation.
+function peerEvidenceHarness() {
+  function element(tag, className, text) {
+    return { tag, className, text, children: [], append(child) { this.children.push(child); } };
+  }
+  const context = vm.createContext({ createElement: element });
+  const names = [
+    "asObject", "finiteNumber", "metricAvailable", "formatOptionalMetric",
+    "formatDuration", "formatRtt", "titleCase", "peerRoundTripEvidence",
+    "pathRoundTripCell", "localPathSortValue", "peerPathSortValue"
+  ];
+  vm.runInContext(names.map(extractFunction).join("\n"), context);
+  return context;
+}
+
+test("peer RTT never falls back to native, model, prior or old peer reports", () => {
+  const h = peerEvidenceHarness();
+  for (const source of ["native_carrier", "mpp_feedback", "configured_prior", "scheduler_default"]) {
+    const path = { srtt_ms: 0.1, latency_source: source };
+    assert.equal(h.peerRoundTripEvidence(path, 0), null);
+    assert.equal(h.pathRoundTripCell(path, false, 0, false).children[0].text, "--");
+    assert.equal(h.localPathSortValue("latency", { path }), null);
+  }
+  const remote = h.pathRoundTripCell({ srtt_us: 100 }, false, 0, true);
+  assert.equal(remote.children[0].text, "--");
+  assert.equal(remote.children[2].text, "Reported RTT 0.10 ms");
+  assert.equal(h.peerPathSortValue("latency", { path: {} }), null);
+});
+
+test("native RTT cannot replace an explicit slow peer observation", () => {
+  const h = peerEvidenceHarness();
+  const path = {
+    srtt_ms: 0.1, latency_source: "native_carrier",
+    peer_round_trip: { rtt_ms: 160, sample_age_ms: 1000, source: "readiness_exchange" }
+  };
+  const cell = h.pathRoundTripCell(path, false, 2000, false);
+  assert.equal(cell.children[0].text, "160 ms");
+  assert.equal(cell.children[1].text, "Last 3.0 s ago");
+  assert.equal(cell.children[2].text, "Transport RTT 0.10 ms");
+  assert.match(cell.title, /not one-way delay or application target latency/);
+  assert.match(cell.title, /last does not mean current/);
+  assert.deepEqual(Array.from(h.localPathSortValue("latency", { path })), [160, 1000]);
+  path.srtt_ms = 0.01;
+  assert.equal(h.peerRoundTripEvidence(path, 8000).ageMs, 9000);
+  assert.equal(h.peerRoundTripEvidence(path, 8000).rttMs, 160);
+});
+
+test("invalid or unscoped samples stay unknown and do not affect RTT sorting", () => {
+  const h = peerEvidenceHarness();
+  const valid = { rtt_ms: 160, sample_age_ms: 0, source: "path_proof" };
+  for (const change of [
+    { rtt_ms: 0 }, { rtt_ms: -1 }, { rtt_ms: NaN }, { rtt_ms: Infinity },
+    { rtt_ms: "160" }, { sample_age_ms: -1 }, { sample_age_ms: NaN },
+    { source: "native_carrier" }, { source: "product_open" }, { source: undefined }
+  ]) {
+    const path = { peer_round_trip: { ...valid, ...change } };
+    assert.equal(h.peerRoundTripEvidence(path, 0), null);
+    assert.equal(h.localPathSortValue("latency", { path }), null);
+  }
+  assert.equal(h.peerRoundTripEvidence({ peer_round_trip: valid }, -100).ageMs, 0);
+});
+
+test("snapshot staleness and legacy-peer absence remain explicit", () => {
+  const h = peerEvidenceHarness();
+  const path = {
+    srtt_ms: 0.1, latency_source: "native_carrier",
+    peer_round_trip: { rtt_ms: 160, sample_age_ms: 60000, source: "path_proof" }
+  };
+  const stale = h.pathRoundTripCell(path, true, 1000, false);
+  assert.equal(stale.children[0].text, "~160 ms");
+  assert.equal(stale.children[1].text, "Last 1m 1s ago");
+  assert.equal(h.pathRoundTripCell(path, false, 0, true).children[0].text, "--");
+});
+
+test("all table headers distinguish peer evidence from transport counters", () => {
+  const html = fs.readFileSync("assets/dashboard/index.html", "utf8");
+  assert.doesNotMatch(html, /completion ETA|>Quality<|>Latency</);
+  assert.equal((html.match(/>Last peer RTT</g) || []).length, 4);
+  assert.equal((html.match(/>ACK share</g) || []).length, 4);
+  assert.equal((html.match(/>Transport rate</g) || []).length, 4);
+  assert.match(dashboard, /not unique application payload/);
+  assert.match(dashboard, /not a physical packet-loss probability or end-to-end MPP failure rate/);
+});

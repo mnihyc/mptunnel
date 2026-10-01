@@ -124,7 +124,7 @@ fn datagram_min_pacing_rate_bps(payload_bytes: usize, pto: Duration) -> f64 {
 
 fn path_bdp_floor_bytes(path: PathSnapshot) -> f64 {
     let rate = path.delivery_rate_bps.max(path.pacing_rate_bps).max(1.0);
-    rate / 8.0 * path.srtt_ms.max(1.0) / 1000.0
+    rate / 8.0 * path.peer_timing().srtt_ms().max(1.0) / 1000.0
 }
 
 fn adaptive_transport_byte_floor_factor(minimum_bytes: f64, model_bytes: f64) -> f64 {
@@ -718,64 +718,81 @@ pub(in crate::runtime) fn path_snapshot_with_id(
             )
         };
     let delivery_rate_bps = delivery_rate_bps.max(1.0);
-    let srtt_ms = path_model_srtt_ms(path, observation);
-    let jitter_ms = observation
-        .carrier_rttvar_ms
-        .or(observation.measured_jitter_ms)
-        .unwrap_or_else(|| f64::from(path.metadata.initial_jitter_ms.unwrap_or(0)));
+    // Native RTT and variation must come from one boundary. Product-open and
+    // Data-ACK elapsed times are diagnostics, not a missing native RTT sample.
+    let (srtt_ms, jitter_ms) = observation.carrier_srtt_ms.map_or_else(
+        || {
+            (
+                path.metadata
+                    .initial_srtt_ms
+                    .map_or_else(default_path_srtt_ms, f64::from),
+                f64::from(path.metadata.initial_jitter_ms.unwrap_or(0)),
+            )
+        },
+        |srtt| (srtt, observation.carrier_rttvar_ms.unwrap_or(0.0)),
+    );
     let confidence = path_model_confidence(observation);
     // Payload completion uses delivered service. Native pacing is retained in
     // the carrier observation, but must not inflate capacity through the
     // scheduler's current max(delivery, pacing) projection.
     let pacing_rate_bps = delivery_rate_bps;
-    PathSnapshot {
-        id: path_id,
-        underlay: path.underlay,
-        state: observation.state,
-        policy: path.metadata.policy,
-        peer_usage: observation.peer_usage,
-        srtt_ms,
-        jitter_ms,
-        delivery_rate_bps,
-        scheduling_service_rate,
-        directional_timing,
-        rate_scope,
-        carrier_delivery_rate_bps: carrier_capacity_rate_bps,
-        product_progress_rate_bps,
-        has_durable_product_progress,
-        loss_rate: match path.underlay {
-            UnderlayProtocol::Tcp => observation
-                .carrier_loss_rate
-                .or(observation.measured_loss_rate),
-            // QUIC native loss is congestion telemetry, not authenticated MPP
-            // datagram feedback; it must not drive Product path pruning.
-            UnderlayProtocol::Udp => observation.measured_loss_rate,
-        }
-        .unwrap_or(0.0),
-        queue_bytes: if observation.carrier_queue_bytes_observed {
-            observation.carrier_queue_bytes
-        } else {
-            0
-        },
-        data_level_queue_bytes: observation.relay_queue_bytes,
-        bytes_in_flight: if observation.carrier_bytes_in_flight_observed {
-            observation.carrier_bytes_in_flight
-        } else {
-            0
-        },
-        data_level_bytes_in_flight: observation.relay_bytes_in_flight,
-        active_flows: observation.active_flows,
-        active_latency_sensitive_flows: observation.active_latency_sensitive_flows,
-        session_active_latency_sensitive_flows: observation.active_latency_sensitive_flows,
-        pacing_rate_bps,
-        carrier_inflight_limit_bytes: observation.carrier_inflight_limit_bytes,
-        data_level_limit_bytes: 0,
-        confidence,
-        // This local scheduler bit is current native underfill, not retained
-        // delivery-epoch provenance. Unknown capability fails closed for the
-        // request-only QUIC acquisition tie-break.
-        app_limited: observation.carrier_current_app_limited == Some(true),
+    let mut snapshot = PathSnapshot::new(path_id, path.underlay, srtt_ms, delivery_rate_bps);
+    let transport = if observation.carrier_srtt_ms.is_some() {
+        crate::model::timing::TransportTiming::new(srtt_ms, jitter_ms)
+    } else {
+        crate::model::timing::TransportTiming::prior(srtt_ms, jitter_ms)
+    };
+    snapshot.set_timing(match path.underlay {
+        UnderlayProtocol::Tcp => crate::model::timing::PathTiming::tcp(
+            transport,
+            observation
+                .peer_timing
+                .unwrap_or(crate::model::timing::PeerTiming::prior(
+                    path.metadata
+                        .initial_srtt_ms
+                        .map_or_else(default_path_srtt_ms, f64::from),
+                    f64::from(path.metadata.initial_jitter_ms.unwrap_or(0)),
+                )),
+        ),
+        UnderlayProtocol::Udp => crate::model::timing::PathTiming::quic(transport),
+    });
+    snapshot.state = observation.state;
+    snapshot.policy = path.metadata.policy;
+    snapshot.peer_usage = observation.peer_usage;
+    snapshot.scheduling_service_rate = scheduling_service_rate;
+    snapshot.directional_timing = directional_timing;
+    snapshot.rate_scope = rate_scope;
+    snapshot.carrier_delivery_rate_bps = carrier_capacity_rate_bps;
+    snapshot.product_progress_rate_bps = product_progress_rate_bps;
+    snapshot.has_durable_product_progress = has_durable_product_progress;
+    snapshot.loss_rate = match path.underlay {
+        UnderlayProtocol::Tcp => observation
+            .carrier_loss_rate
+            .or(observation.measured_loss_rate),
+        // Native QUIC loss does not prove loss of authenticated MPP datagrams.
+        UnderlayProtocol::Udp => observation.measured_loss_rate,
     }
+    .unwrap_or(0.0);
+    snapshot.queue_bytes = if observation.carrier_queue_bytes_observed {
+        observation.carrier_queue_bytes
+    } else {
+        0
+    };
+    snapshot.data_level_queue_bytes = observation.relay_queue_bytes;
+    snapshot.bytes_in_flight = if observation.carrier_bytes_in_flight_observed {
+        observation.carrier_bytes_in_flight
+    } else {
+        0
+    };
+    snapshot.data_level_bytes_in_flight = observation.relay_bytes_in_flight;
+    snapshot.active_flows = observation.active_flows;
+    snapshot.active_latency_sensitive_flows = observation.active_latency_sensitive_flows;
+    snapshot.session_active_latency_sensitive_flows = observation.active_latency_sensitive_flows;
+    snapshot.pacing_rate_bps = pacing_rate_bps;
+    snapshot.carrier_inflight_limit_bytes = observation.carrier_inflight_limit_bytes;
+    snapshot.confidence = confidence;
+    snapshot.app_limited = observation.carrier_current_app_limited == Some(true);
+    snapshot
 }
 
 /// Converts an endpoint-local configured rate prior into the common positive
@@ -1045,9 +1062,9 @@ pub(in crate::runtime) fn path_metrics_from_snapshot_at(
         metric_age_us,
         rate_valid_for_us,
         rate_observed: has_rate_epoch,
-        srtt_us: millis_to_micros_u32(snapshot.srtt_ms),
-        rttvar_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
-        jitter_us: millis_to_micros_u32(snapshot.jitter_ms.max(0.0)),
+        srtt_us: millis_to_micros_u32(snapshot.transport_timing().srtt_ms()),
+        rttvar_us: millis_to_micros_u32(snapshot.transport_timing().rttvar_ms().max(0.0)),
+        jitter_us: millis_to_micros_u32(snapshot.transport_timing().rttvar_ms().max(0.0)),
         delivery_rate_bps: wire_delivery_rate_bps.round() as u64,
         pacing_rate_bps: pacing_rate_bps.max(1.0).round() as u64,
         pacing_rate_observed,
@@ -1402,6 +1419,7 @@ pub(in crate::runtime) struct ClientPathObservation {
     pub(in crate::runtime) wire_path_id: Option<PathId>,
     pub(in crate::runtime) path_instance_id: Option<CarrierPathInstanceId>,
     pub(in crate::runtime) peer_usage: Option<PathUsage>,
+    pub(in crate::runtime) peer_timing: Option<crate::model::timing::PeerTiming>,
     pub(in crate::runtime) measured_srtt_ms: Option<f64>,
     pub(in crate::runtime) measured_jitter_ms: Option<f64>,
     pub(in crate::runtime) measured_rate_bps: Option<f64>,
@@ -1469,6 +1487,7 @@ impl Default for ClientPathObservation {
             wire_path_id: None,
             path_instance_id: None,
             peer_usage: None,
+            peer_timing: None,
             measured_srtt_ms: None,
             measured_jitter_ms: None,
             measured_rate_bps: None,

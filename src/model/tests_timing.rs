@@ -22,7 +22,10 @@ fn data_ack_loss_delay_uses_rack_and_quic_time_thresholds() {
 #[test]
 fn data_ack_gap_repair_uses_absolute_completion_and_owner_fallback() {
     let mut tcp = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 80.0, 1.0);
-    tcp.jitter_ms = 10.0;
+    tcp.set_timing(crate::model::timing::PathTiming::startup(
+        tcp.peer_timing().srtt_ms(),
+        10.0,
+    ));
     let assignment_at = Instant::now();
     let loss_at = assignment_at + Duration::from_millis(100);
     let recovery_at = assignment_at + Duration::from_millis(200);
@@ -158,7 +161,10 @@ fn data_ack_gap_repair_races_owner_delivery_not_fallback_firing() {
 #[test]
 fn data_ack_silence_waits_for_the_owner_recovery_interval() {
     let mut tcp = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 80.0, 1.0);
-    tcp.jitter_ms = 10.0;
+    tcp.set_timing(crate::model::timing::PathTiming::startup(
+        tcp.peer_timing().srtt_ms(),
+        10.0,
+    ));
     let assigned_at = Instant::now();
 
     assert_eq!(
@@ -184,15 +190,24 @@ fn data_ack_silence_waits_for_the_owner_recovery_interval() {
 #[test]
 fn tcp_data_retransmission_uses_rto_without_quic_ack_delay() {
     let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 80.0, 1.0);
-    path.jitter_ms = 10.0;
+    path.set_timing(crate::model::timing::PathTiming::startup(
+        path.peer_timing().srtt_ms(),
+        10.0,
+    ));
 
     assert_eq!(
         reliable_data_retransmission_interval(Some(UnderlayProtocol::Tcp), Some(path)),
         Duration::from_millis(200),
     );
 
-    path.srtt_ms = 500.0;
-    path.jitter_ms = 60.0;
+    path.set_timing(crate::model::timing::PathTiming::startup(
+        500.0,
+        path.peer_timing().rttvar_ms(),
+    ));
+    path.set_timing(crate::model::timing::PathTiming::startup(
+        path.peer_timing().srtt_ms(),
+        60.0,
+    ));
     assert_eq!(
         reliable_data_retransmission_interval(Some(UnderlayProtocol::Tcp), Some(path)),
         Duration::from_millis(750),
@@ -202,7 +217,10 @@ fn tcp_data_retransmission_uses_rto_without_quic_ack_delay() {
 #[test]
 fn quic_data_retransmission_uses_pto() {
     let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 500.0, 1.0);
-    path.jitter_ms = 60.0;
+    path.set_timing(crate::model::timing::PathTiming::startup(
+        path.peer_timing().srtt_ms(),
+        60.0,
+    ));
 
     assert_eq!(
         reliable_data_retransmission_interval(Some(UnderlayProtocol::Udp), Some(path)),
@@ -213,14 +231,20 @@ fn quic_data_retransmission_uses_pto() {
 #[test]
 fn stale_path_threshold_is_later_than_data_retransmission() {
     let mut tcp = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 80.0, 1.0);
-    tcp.jitter_ms = 10.0;
+    tcp.set_timing(crate::model::timing::PathTiming::startup(
+        tcp.peer_timing().srtt_ms(),
+        10.0,
+    ));
     assert_eq!(
         reliable_path_stale_interval(Some(UnderlayProtocol::Tcp), Some(tcp)),
         Duration::from_millis(800),
     );
 
     let mut quic = PathSnapshot::new(PathId(1), UnderlayProtocol::Udp, 80.0, 1.0);
-    quic.jitter_ms = 10.0;
+    quic.set_timing(crate::model::timing::PathTiming::startup(
+        quic.peer_timing().srtt_ms(),
+        10.0,
+    ));
     let pto = transport_pto_from_snapshot(Some(quic));
     assert_eq!(
         reliable_path_stale_interval(Some(UnderlayProtocol::Udp), Some(quic)),
@@ -235,4 +259,45 @@ fn cold_reliable_path_open_counts_transport_join_and_stream_acceptance() {
 
     assert_eq!(path_open_serialized_exchanges(Some(tcp)), 3);
     assert_eq!(path_open_serialized_exchanges(Some(quic)), 3);
+}
+
+#[test]
+fn split_tcp_data_ack_clock_reaches_the_mpp_peer_but_native_rto_stays_local() {
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 0.1, 1.0);
+    path.set_timing(crate::model::timing::PathTiming::tcp(
+        path.transport_timing(),
+        PeerTiming::new(160.0, 40.0),
+    ));
+    let assigned = Instant::now();
+    let gap = reliable_data_ack_gap_timing(Some(assigned), Some(UnderlayProtocol::Tcp), Some(path))
+        .unwrap();
+    assert_eq!(gap.assignment_at, assigned);
+    assert_eq!(gap.loss_at, Some(assigned + Duration::from_millis(200)));
+    assert_eq!(gap.fallback_at, assigned + Duration::from_millis(320));
+    assert_eq!(
+        tcp_retransmission_timeout_from_snapshot(Some(path)),
+        Duration::from_millis(200)
+    );
+    assert_eq!(path_open_pto(Some(path), true), Duration::from_millis(345));
+}
+
+#[test]
+fn native_startup_does_not_remove_peer_establishment_floor() {
+    let mut path = PathSnapshot::new(PathId(0), UnderlayProtocol::Udp, 10.0, 1.0);
+    path.set_timing(PathTiming::quic(TransportTiming::from_native_or_prior(
+        Duration::ZERO,
+        Duration::from_millis(50),
+        path.transport_timing(),
+    )));
+    assert!(!path.peer_timing().is_observed());
+    assert_eq!(path.peer_timing().rttvar_ms(), 0.0);
+    assert_eq!(path_open_pto(Some(path), true), default_transport_pto());
+
+    path.set_timing(PathTiming::quic(TransportTiming::from_native_or_prior(
+        Duration::from_millis(20),
+        Duration::from_millis(5),
+        path.transport_timing(),
+    )));
+    assert!(path.peer_timing().is_observed());
+    assert_eq!(path_open_pto(Some(path), true), Duration::from_millis(65));
 }

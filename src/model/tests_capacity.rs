@@ -100,7 +100,10 @@ fn data_level_budgets_expand_for_bulk_without_second_congestion_feedback() {
     let stable = PathSnapshot::new(PathId(0), UnderlayProtocol::Tcp, 120.0, 300_000_000.0);
     let mut unstable = stable;
     unstable.loss_rate = 0.25;
-    unstable.jitter_ms = 120.0;
+    unstable.set_timing(crate::model::timing::PathTiming::startup(
+        unstable.peer_timing().srtt_ms(),
+        120.0,
+    ));
     unstable.queue_bytes = 8 * 1024 * 1024;
 
     let interactive_chunk =
@@ -120,8 +123,9 @@ fn data_level_budgets_expand_for_bulk_without_second_congestion_feedback() {
     let bulk_inflight =
         reliable_product_feedback_window_bytes(Some(stable), TrafficClass::Throughput, mux_limits);
     let mut stable_with_flight = stable;
-    stable_with_flight.bytes_in_flight =
-        ((stable.delivery_rate_bps / 8.0) * (stable.srtt_ms / 1000.0)).ceil() as u64;
+    stable_with_flight.bytes_in_flight = ((stable.delivery_rate_bps / 8.0)
+        * (stable.peer_timing().srtt_ms() / 1000.0))
+        .ceil() as u64;
     let bulk_inflight_with_flight = reliable_product_feedback_window_bytes(
         Some(stable_with_flight),
         TrafficClass::Throughput,

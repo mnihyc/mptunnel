@@ -54,6 +54,7 @@ pub(in crate::runtime) struct ClientTcpCarrierPublication {
     pub(in crate::runtime) peer_usage_sequence: u64,
     pub(in crate::runtime) peer_usage: PathUsage,
     pub(in crate::runtime) readiness_rtt: Option<Duration>,
+    pub(super) peer_timing: Option<Arc<super::peer_round_trip::PeerRoundTrip>>,
     pub(in crate::runtime) local_addr: Option<std::net::SocketAddr>,
     pub(in crate::runtime) peer_addr: Option<std::net::SocketAddr>,
 }
@@ -460,6 +461,7 @@ impl ClientPathState {
                     publication.peer_usage_sequence,
                     publication.peer_usage,
                 );
+                record.peer_timing = publication.peer_timing.clone();
             });
             publish_readiness();
             drop(health);
@@ -486,7 +488,10 @@ impl ClientPathState {
                     index: publication.path_index,
                 },
                 |record| {
-                    record.mark_success_for_instance(publication.path_instance_id, readiness_rtt)
+                    record.mark_readiness_round_trip_for_instance(
+                        publication.path_instance_id,
+                        readiness_rtt,
+                    )
                 },
             );
         }
@@ -524,6 +529,7 @@ impl ClientPathState {
                     publication.peer_usage_sequence,
                     publication.peer_usage,
                 );
+                record.peer_timing = publication.peer_timing.clone();
             });
             publish_readiness();
             drop(health);
@@ -551,7 +557,10 @@ impl ClientPathState {
                     index: publication.path_index,
                 },
                 |record| {
-                    record.mark_success_for_instance(publication.path_instance_id, readiness_rtt)
+                    record.mark_readiness_round_trip_for_instance(
+                        publication.path_instance_id,
+                        readiness_rtt,
+                    )
                 },
             );
         }

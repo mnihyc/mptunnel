@@ -2636,6 +2636,13 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         enter_phase("initial TCP readiness");
         wait_for_tcp_ready_count(&context, 1).await;
 
+        // This fixture aborts an additional QUIC attachment. Keep initial
+        // acquisition on TCP explicitly, rather than assuming native TCP RTT
+        // wins against a QUIC startup prior. Otherwise the one-shot abort hook
+        // can bind an earlier acquisition attempt instead of the one below.
+        context.health().lock().expect("health lock").udp[0]
+            .mutate_eligibility(|record| record.manual_disabled = true);
+
         let stream_id = StreamId(0);
         let initial_tcp_instance = context.tcp_sessions[0]
             .connection_instance_id()
@@ -2662,6 +2669,8 @@ async fn live_quic_request_stream_abort_reattaches_same_carrier_after_one_pto() 
         );
 
         enter_phase("QUIC path probe");
+        context.health().lock().expect("health lock").udp[0]
+            .mutate_eligibility(|record| record.manual_disabled = false);
         probe_client_paths(&context, Duration::from_millis(500)).await;
         // Optional measurement may leave the owner absent. This fixture
         // explicitly requires a live carrier before testing operation recovery;
@@ -3157,6 +3166,8 @@ async fn socks5_ingress_uses_ranked_tcp_carriers_for_product_stream() {
     probe_client_paths(&context, Duration::from_secs(2)).await;
     {
         let mut health = context.health().lock().expect("health lock");
+        health.tcp[0].set_peer_timing_for_test(200.0, 50.0);
+        health.tcp[1].set_peer_timing_for_test(10.0, 2.5);
         health.tcp[0].carrier_srtt_ms = Some(200.0);
         health.tcp[0].carrier_rttvar_ms = Some(50.0);
         health.tcp[1].carrier_srtt_ms = Some(10.0);
@@ -3281,8 +3292,10 @@ async fn socks5_ingress_starts_reliable_auto_latency_first() {
         let mut health = context.health().lock().expect("health lock");
         health.tcp[0].carrier_srtt_ms = Some(10.0);
         health.tcp[0].carrier_rttvar_ms = Some(2.5);
+        health.tcp[0].set_peer_timing_for_test(10.0, 2.5);
         health.tcp[1].carrier_srtt_ms = Some(120.0);
         health.tcp[1].carrier_rttvar_ms = Some(30.0);
+        health.tcp[1].set_peer_timing_for_test(120.0, 30.0);
     }
     let ready_paths = HashSet::from([
         accepted_rx.recv().await.expect("first ready TCP carrier"),

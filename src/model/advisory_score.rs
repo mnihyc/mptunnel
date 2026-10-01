@@ -203,12 +203,10 @@ impl DirectionalTiming {
         self.epoch
     }
 
-    #[cfg(test)]
     pub(crate) const fn round_trip_time(self) -> Duration {
         self.round_trip_time
     }
 
-    #[cfg(test)]
     pub(crate) const fn variation(self) -> Option<Duration> {
         self.variation
     }

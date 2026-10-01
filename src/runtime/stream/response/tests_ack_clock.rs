@@ -343,6 +343,35 @@ fn tcp_first_post_expiry_ack_seeds_and_second_ack_qualifies_new_epoch() {
 }
 
 #[test]
+fn tcp_product_rate_epoch_uses_peer_timing_without_renewing_on_native_updates() {
+    let (binding, key, _receivers) = binding_for_underlay(UnderlayProtocol::Tcp);
+    binding.set_output_peer_timing_for_test(key, 160.0, 20.0);
+    let observed_at = Instant::now();
+    let mut outputs = binding.outputs.lock().unwrap();
+    let entry = &mut outputs.entries[0];
+    entry.local_path_metrics = Some(local_timing_metrics(
+        key,
+        Duration::from_micros(100),
+        Duration::from_micros(25),
+    ));
+    install_response_product_rate_epoch(entry, 100_000_000.0, 1, 524_288, observed_at);
+    let expected =
+        observed_at + crate::model::timing::PeerTiming::new(160.0, 20.0).rate_freshness_horizon();
+    assert_eq!(entry.product_rate_epoch.unwrap().expires_at, expected);
+    drop(outputs);
+    binding.set_output_peer_timing_for_test(key, 1.0, 0.125);
+    let outputs = binding.outputs.lock().unwrap();
+    let epoch = outputs.entries[0].product_rate_epoch.unwrap();
+    assert_eq!(epoch.expires_at, expected);
+    assert!(
+        epoch
+            .fresh_rate_at(expected - Duration::from_nanos(1))
+            .is_some()
+    );
+    assert_eq!(epoch.fresh_rate_at(expected), None);
+}
+
+#[test]
 fn udp_post_expiry_sample_does_not_ewma_with_stale_epoch() {
     let (binding, key, _receivers) = binding_for_underlay(UnderlayProtocol::Udp);
     let first_ack = Instant::now();

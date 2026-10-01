@@ -646,7 +646,7 @@ fn bulk_reorder_budget_bytes(
 
 fn bulk_path_bdp_bytes(candidate: PathSnapshot) -> u64 {
     let rate = bulk_effective_rate_bps(candidate);
-    bulk_rate_bdp_bytes(rate, candidate.srtt_ms)
+    bulk_rate_bdp_bytes(rate, candidate.peer_timing().srtt_ms())
 }
 
 #[cfg(test)]

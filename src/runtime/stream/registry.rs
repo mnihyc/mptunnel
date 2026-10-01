@@ -109,6 +109,8 @@ struct ServerPathUsageEntry {
 
 #[derive(Clone)]
 struct ServerRegisteredPath {
+    peer_timing: Option<Arc<crate::runtime::path::peer_round_trip::PeerRoundTrip>>,
+    peer_round_trip: Option<crate::runtime::path::peer_round_trip::PeerRoundTripObservation>,
     native_delivery: Option<crate::protocol::NativeDeliverySnapshot>,
     /// Authenticated peer configuration identity, stable across a physical
     /// replacement which receives a new PathId and instance identity.
@@ -131,6 +133,8 @@ struct ServerRegisteredPath {
 
 #[derive(Debug, Clone, Copy)]
 struct ServerCarrierPathStatusBasis {
+    peer_timing: Option<crate::model::timing::PeerTiming>,
+    peer_round_trip: Option<crate::runtime::path::peer_round_trip::PeerRoundTripObservation>,
     native_delivery: Option<crate::protocol::NativeDeliverySnapshot>,
     identity: ServerCarrierPathIdentity,
     local: crate::runtime::path::ServerLocalPathProperties,
@@ -143,11 +147,24 @@ struct ServerCarrierPathStatusBasis {
 impl ServerCarrierPathStatusBasis {
     /// Capture structural state and its apply epoch under the registry owner.
     /// Callers must hold `registered_path_instances` while invoking this.
-    fn capture(identity: ServerCarrierPathIdentity, path: &ServerRegisteredPath) -> Self {
+    fn capture(
+        identity: ServerCarrierPathIdentity,
+        path: &ServerRegisteredPath,
+        now: Instant,
+    ) -> Self {
         let apply = path.apply_authority.snapshot();
         Self {
             identity,
+            peer_timing: path
+                .peer_timing
+                .as_ref()
+                .map(|timing| timing.timing_or_prior_at(now)),
             native_delivery: path.native_delivery,
+            peer_round_trip: path
+                .peer_timing
+                .as_ref()
+                .and_then(|timing| timing.last())
+                .or(path.peer_round_trip),
             local: path.local,
             state: path.state,
             usage: path.peer_usage.map(|entry| entry.usage),
@@ -892,6 +909,7 @@ impl ServerReliableStreamRegistry {
                                 path_instance_id,
                             },
                             path,
+                            now,
                         )
                     },
                 )
@@ -945,7 +963,7 @@ impl ServerReliableStreamRegistry {
                     registered
                         .instances
                         .get(&server_physical_path_key(*identity))
-                        .map(|path| ServerCarrierPathStatusBasis::capture(*identity, path))
+                        .map(|path| ServerCarrierPathStatusBasis::capture(*identity, path, now))
                 })
                 .collect::<Vec<_>>()
         };
@@ -1229,6 +1247,8 @@ impl ServerReliableStreamRegistry {
             .insert(
                 server_physical_path_key(identity),
                 ServerRegisteredPath {
+                    peer_round_trip: None,
+                    peer_timing: None,
                     native_delivery: None,
                     configured_slot,
                     local,
@@ -2008,6 +2028,24 @@ impl ServerReliableStreamRegistry {
             let Some(path) = registered.instances.get_mut(&instance_key) else {
                 return;
             };
+            // Keep repeated observations without changing the first-proof
+            // authority or fanout semantics below.
+            if let Some(observed_at) = observation.sent_at.checked_add(observation.elapsed) {
+                if let Some(timing) = &path.peer_timing {
+                    timing.record(
+                        observation.elapsed,
+                        observed_at,
+                        crate::runtime::path::peer_round_trip::PeerRoundTripSource::PathProof,
+                    );
+                } else {
+                    crate::runtime::path::peer_round_trip::PeerRoundTripObservation::accept(
+                        &mut path.peer_round_trip,
+                        observation.elapsed,
+                        observed_at,
+                        crate::runtime::path::peer_round_trip::PeerRoundTripSource::PathProof,
+                    );
+                }
+            }
             if path.path_proof.is_some() {
                 false
             } else {
@@ -2980,6 +3018,26 @@ impl ServerStreamPortBackend for ServerReliableStreamPortBackend {
             .fanout_native_scheduling_shape(identity, shape);
     }
 
+    fn bind_peer_timing(
+        &self,
+        identity: ServerCarrierPathIdentity,
+        timing: Arc<crate::runtime::path::peer_round_trip::PeerRoundTrip>,
+    ) {
+        let mut registered = self
+            .registry
+            .registered_path_instances
+            .lock()
+            .expect("server active path instance lock");
+        if let Some(path) = registered.instances.get_mut(&(
+            identity.session_id,
+            identity.underlay,
+            identity.path_id,
+            identity.path_instance_id,
+        )) {
+            path.peer_timing = Some(timing);
+        }
+    }
+
     fn record_path_proof_success(
         &self,
         identity: ServerCarrierPathIdentity,
@@ -3053,6 +3111,8 @@ fn project_carrier_path_status(
         },
     );
     ServerCarrierPathStatusSnapshot {
+        peer_round_trip: basis.peer_round_trip,
+        peer_timing: basis.peer_timing,
         native_delivery: basis.native_delivery,
         session_id,
         underlay,

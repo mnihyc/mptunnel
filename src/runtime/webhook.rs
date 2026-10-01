@@ -311,6 +311,8 @@ pub(crate) struct WebhookRuleStats {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct WebhookLastResult {
+    pub event_id: String,
+    pub delivery_id: String,
     pub stage: String,
     pub status: Option<u16>,
     pub success: bool,
@@ -1362,8 +1364,41 @@ fn record_last_result(shared: &Shared, rule: usize, delivery: &Delivery, outcome
     let Some(rule_stats) = shared.stats.rules.get(rule) else {
         return;
     };
+    // Keep endpoint URLs, headers, payloads and raw transport errors out of
+    // diagnostics. Separate rate limiters prevent success traffic from hiding
+    // all failures. The management snapshot remains available if logs throttle.
+    if outcome.success {
+        crate::observability::process_event!(
+            Info,
+            "webhook",
+            "delivery_succeeded",
+            "rule={} event_id={} delivery_id={} attempt={} stage={} status={:?}",
+            rule_stats.name,
+            delivery.event_id,
+            delivery.delivery_id,
+            delivery.attempt,
+            outcome.stage,
+            outcome.status,
+        );
+    } else {
+        crate::observability::process_event!(
+            Warn,
+            "webhook",
+            "delivery_unsuccessful",
+            "rule={} event_id={} delivery_id={} attempt={} stage={} status={:?} retryable={}",
+            rule_stats.name,
+            delivery.event_id,
+            delivery.delivery_id,
+            delivery.attempt,
+            outcome.stage,
+            outcome.status,
+            outcome.retryable,
+        );
+    }
     if let Ok(mut last_result) = rule_stats.last_result.lock() {
         *last_result = Some(WebhookLastResult {
+            event_id: delivery.event_id.clone(),
+            delivery_id: delivery.delivery_id.clone(),
             stage: outcome.stage.to_owned(),
             status: outcome.status,
             success: outcome.success,
@@ -1381,16 +1416,19 @@ fn record_expired(shared: &Shared, delivery: &Delivery) {
         .fetch_add(1, Ordering::Relaxed);
     if let Some(rule_stats) = shared.stats.rules.get(delivery.rule) {
         rule_stats.expired.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut last_result) = rule_stats.last_result.lock() {
-            *last_result = Some(WebhookLastResult {
-                stage: "expired".to_owned(),
-                status: None,
-                success: false,
-                attempt: delivery.attempt,
-                observed_at: utc_now(),
-            });
-        }
     }
+    record_last_result(
+        shared,
+        delivery.rule,
+        delivery,
+        &AttemptOutcome {
+            stage: "expired",
+            status: None,
+            success: false,
+            retryable: false,
+            retry_after: None,
+        },
+    );
 }
 
 fn expire_waiting_retries(
@@ -1531,6 +1569,16 @@ async fn run_attempt(
         };
     }
     delivery.attempt = delivery.attempt.saturating_add(1);
+    crate::observability::process_event!(
+        Debug,
+        "webhook",
+        "attempt_started",
+        "rule={} event_id={} delivery_id={} attempt={}",
+        rule.name,
+        delivery.event_id,
+        delivery.delivery_id,
+        delivery.attempt,
+    );
     shared.stats.attempts.fetch_add(1, Ordering::Relaxed);
     if let Some(rule_stats) = shared.stats.rules.get(rule_index) {
         rule_stats.attempts.fetch_add(1, Ordering::Relaxed);
@@ -1743,6 +1791,52 @@ mod tests {
         enqueue_source(shared, source, false, None);
         sweep_source_events(shared);
         shared.state.lock().unwrap().jobs[0].pop_front().unwrap()
+    }
+
+    #[tokio::test]
+    async fn delivery_diagnostics_retain_correlation_without_request_material() {
+        let shared = configured_shared(DeliveryPolicy::default(), 4);
+        let mut delivery = enqueue_one_delivery(&shared);
+        Arc::make_mut(&mut delivery.envelope)["private_payload"] = json!("do-not-log-me");
+        delivery.attempt = 1;
+        for (success, stage, status) in [
+            (true, "response", Some(204)),
+            (false, "http_status", Some(503)),
+            (false, "timeout", None),
+        ] {
+            record_last_result(
+                &shared,
+                0,
+                &delivery,
+                &AttemptOutcome {
+                    success,
+                    stage,
+                    status,
+                    retryable: !success,
+                    retry_after: None,
+                },
+            );
+            let snapshot = shared.stats.snapshot();
+            let last = snapshot.rules[0].last_result.as_ref().unwrap();
+            assert_eq!(last.event_id, delivery.event_id);
+            assert_eq!(last.delivery_id, delivery.delivery_id);
+            assert_eq!(last.stage, stage);
+            assert_eq!(last.status, status);
+            assert_eq!(last.success, success);
+            assert_eq!(last.attempt, 1);
+            let serialized = serde_json::to_string(&snapshot).unwrap();
+            assert!(!serialized.contains("private_payload"));
+            assert!(!serialized.contains("do-not-log-me"));
+            assert!(!serialized.contains("http://127.0.0.1/hook"));
+        }
+        record_expired(&shared, &delivery);
+        let snapshot = shared.stats.snapshot();
+        let last = snapshot.rules[0].last_result.as_ref().unwrap();
+        assert_eq!(last.stage, "expired");
+        assert_eq!(last.event_id, delivery.event_id);
+        assert_eq!(last.delivery_id, delivery.delivery_id);
+        assert_eq!(snapshot.expired_deliveries, 1);
+        assert_eq!(snapshot.pending_deliveries, 0);
     }
 
     async fn read_request_body(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
